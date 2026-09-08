@@ -174,7 +174,7 @@ def _watcher() -> None:
 
 
 @mcp.tool
-def spravochnik(napravlenie: str = "") -> dict:
+def exchange_overview(direction: str = "") -> dict:
     """Что вообще есть в правилах обмена: направления, документы, процессы.
 
     Без параметра — список направлений обмена. С направлением («УПП → ЕРП»,
@@ -183,7 +183,7 @@ def spravochnik(napravlenie: str = "") -> dict:
     Отсюда стоит начинать, если неизвестно точное имя документа.
     """
     ix = index()
-    if not napravlenie:
+    if not direction:
         return {
             "направления": [
                 {
@@ -198,8 +198,8 @@ def spravochnik(napravlenie: str = "") -> dict:
             **status(),
         }
 
-    direction = ix.resolve(napravlenie)
-    docs = ix.documents(direction)
+    exch = ix.resolve(direction)
+    docs = ix.documents(exch)
 
     def line(name: str, info: dict) -> str:
         marks = []
@@ -214,16 +214,16 @@ def spravochnik(napravlenie: str = "") -> dict:
         return f"{name} — {'; '.join(marks)}"
 
     return {
-        "направление": direction.title,
-        "ключ": direction.key,
+        "направление": exch.title,
+        "ключ": exch.key,
         "документы": [line(n, docs[n]) for n in sorted(docs)],
-        "процессы": {b: ", ".join(d) for b, d in ix.blocks(direction).items()},
+        "процессы": {b: ", ".join(d) for b, d in ix.blocks(exch).items()},
         **status(),
     }
 
 
 @mcp.tool
-def trassirovka(dokument: str, napravlenie: str) -> dict:
+def trace_document(document: str, direction: str) -> dict:
     """Что происходит с документом при обмене — от регистрации до приёмника.
 
     Главный инструмент. Показывает: при каких условиях документ регистрируется
@@ -232,25 +232,25 @@ def trassirovka(dokument: str, napravlenie: str) -> dict:
     (их не видно в самих ветках выгрузки).
     """
     ix = index()
-    direction = ix.resolve(napravlenie)
-    pros = ix.pro_for(direction, dokument)
-    pvds = ix.pvd_for(direction, dokument)
+    exch = ix.resolve(direction)
+    pros = ix.pro_for(exch, document)
+    pvds = ix.pvd_for(exch, document)
     if not pros and not pvds:
         # Своей ветки выгрузки нет. Так переносятся справочники — их тянут
         # подчинённые правила из документов. Показываем, кто именно.
-        carried = ix.carried_by(direction, dokument)
+        carried = ix.carried_by(exch, document)
         if carried:
             return {
-                "направление": direction.title,
-                "объект": dokument,
+                "направление": exch.title,
+                "объект": document,
                 "выгрузка": "своей ветки выгрузки нет — переносится подчинённым правилом",
                 "переносится правилами": carried,
-                "подсказка": "Состав реквизитов — инструмент pravilo по имени правила.",
+                "подсказка": "Состав реквизитов — инструмент get_conversion_rule по имени правила.",
                 **status(),
             }
-        near = [n for n in ix.documents(direction) if dokument.casefold() in n.casefold()]
+        near = [n for n in ix.documents(exch) if document.casefold() in n.casefold()]
         raise LookupError(
-            f"в направлении {direction.title} правил на «{dokument}» нет"
+            f"в направлении {exch.title} правил на «{document}» нет"
             " — ни регистрации, ни выгрузки, ни конвертации."
             + (f" Похожие: {', '.join(sorted(near)[:10])}" if near else "")
         )
@@ -273,13 +273,13 @@ def trassirovka(dokument: str, napravlenie: str) -> dict:
     for pvd in pvds:
         called = []
         for name in pvd.pko_calls:
-            pko = direction.pko.get(name)
-            cascades = ix.cascades(direction, name) if pko else []
+            pko = exch.pko.get(name)
+            cascades = ix.cascades(exch, name) if pko else []
             doc_cascades = sorted(
                 {
-                    obj_short(direction.pko[c].dst)
+                    obj_short(exch.pko[c].dst)
                     for c in cascades
-                    if c in direction.pko and direction.pko[c].dst.startswith("Документ")
+                    if c in exch.pko and exch.pko[c].dst.startswith("Документ")
                 }
             )
             called.append(
@@ -300,40 +300,40 @@ def trassirovka(dokument: str, napravlenie: str) -> dict:
             {
                 "код": pvd.code,
                 "отключено": pvd.disabled,
-                "процессы": ix.pvd_blocks(direction, pvd),
+                "процессы": ix.pvd_blocks(exch, pvd),
                 "обработчики": sorted(pvd.handlers),
                 "вызываемые правила конвертации": called,
             }
         )
 
     return {
-        "направление": direction.title,
-        "документ": dokument,
+        "направление": exch.title,
+        "документ": document,
         "регистрация": registration or "правил регистрации нет — документ выгружается иначе",
         "выгрузка": branches or "правил выгрузки нет",
         "документы приёмника": {k: sorted(v) for k, v in sorted(receivers.items())},
-        "подсказка": "Полный состав реквизитов правила — инструмент pravilo. "
-        "Что правила ждут от конфигурации приёмника — ozhidaniya_priemnika.",
+        "подсказка": "Полный состав реквизитов правила — инструмент get_conversion_rule. "
+        "Что правила ждут от конфигурации приёмника — receiver_fields.",
         **status(),
     }
 
 
 @mcp.tool
-def pravilo(imya: str, napravlenie: str, podrobno: bool = False) -> dict:
+def get_conversion_rule(rule: str, direction: str, verbose: bool = False) -> dict:
     """Карточка одного правила конвертации: реквизиты, табличные части, каскады.
 
     Показывает соответствия «реквизит источника → реквизит приёмника» с типами,
     отмечает поля поиска, отключённые строки и реквизиты, заполняемые алгоритмом
-    (у них пустой источник). С podrobno=True добавляет тексты обработчиков —
+    (у них пустой источник). С verbose=True добавляет тексты обработчиков —
     они объёмные, поэтому по умолчанию выключены.
     """
     ix = index()
-    direction = ix.resolve(napravlenie)
-    pko = ix.find_pko(direction, imya)
+    exch = ix.resolve(direction)
+    pko = ix.find_pko(exch, rule)
     if pko is None:
-        near = [c for c in direction.pko if imya.casefold() in c.casefold()]
+        near = [c for c in exch.pko if rule.casefold() in c.casefold()]
         raise LookupError(
-            f"правила конвертации «{imya}» в направлении {direction.title} нет."
+            f"правила конвертации «{rule}» в направлении {exch.title} нет."
             + (f" Похожие: {', '.join(sorted(near)[:10])}" if near else "")
         )
 
@@ -354,7 +354,7 @@ def pravilo(imya: str, napravlenie: str, podrobno: bool = False) -> dict:
         return item
 
     card = {
-        "направление": direction.title,
+        "направление": exch.title,
         "правило": pko.code,
         "наименование": pko.name,
         "отключено": pko.disabled,
@@ -370,17 +370,17 @@ def pravilo(imya: str, napravlenie: str, podrobno: bool = False) -> dict:
             }
             for s in pko.sections
         ],
-        "каскады в подчинённые правила": ix.cascades(direction, pko.code),
+        "каскады в подчинённые правила": ix.cascades(exch, pko.code),
         "обработчики": sorted(pko.handlers),
         **status(),
     }
-    if podrobno:
+    if verbose:
         card["тексты обработчиков"] = pko.handlers
     return card
 
 
 @mcp.tool
-def poisk(tekst: str, napravlenie: str = "", limit: int = 40) -> dict:
+def search_rules(query: str, direction: str = "", limit: int = 40) -> dict:
     """Где в правилах упоминается реквизит, алгоритм или фрагмент логики.
 
     Ищет по соответствиям реквизитов, отборам регистрации и текстам
@@ -389,15 +389,15 @@ def poisk(tekst: str, napravlenie: str = "", limit: int = 40) -> dict:
     """
     ix = index()
     targets = (
-        [ix.resolve(napravlenie)] if napravlenie else list(ix.directions.values())
+        [ix.resolve(direction)] if direction else list(ix.directions.values())
     )
-    needle = tekst.casefold()
+    needle = query.casefold()
     hits: list[dict] = []
 
-    def add(direction, where: str, what: str, snippet: str = "") -> bool:
+    def add(exch, where: str, what: str, snippet: str = "") -> bool:
         hits.append(
             {
-                "направление": direction.key,
+                "направление": exch.key,
                 "где": where,
                 "что": what,
                 **({"фрагмент": snippet} if snippet else {}),
@@ -405,29 +405,29 @@ def poisk(tekst: str, napravlenie: str = "", limit: int = 40) -> dict:
         )
         return len(hits) >= limit
 
-    for direction in targets:
-        for pko in direction.pko.values():
+    for exch in targets:
+        for pko in exch.pko.values():
             props = list(pko.props) + [p for s in pko.sections for p in s.props]
             for prop in props:
                 if needle in f"{prop.src} {prop.dst} {prop.dst_type}".casefold():
                     if add(
-                        direction,
+                        exch,
                         f"правило конвертации {pko.code}",
                         f"{prop.src or '—'} → {prop.dst} ({prop.dst_type})",
                     ):
                         return {"найдено": hits, "обрезано по лимиту": True, **status()}
             for name, code in pko.handlers.items():
                 for line in _matching_lines(code, needle):
-                    if add(direction, f"правило конвертации {pko.code}", name, line):
+                    if add(exch, f"правило конвертации {pko.code}", name, line):
                         return {"найдено": hits, "обрезано по лимиту": True, **status()}
-        for pvd in direction.pvd:
+        for pvd in exch.pvd:
             for name, code in pvd.handlers.items():
                 for line in _matching_lines(code, needle):
-                    if add(direction, f"выгрузка {obj_short(pvd.obj)}", name, line):
+                    if add(exch, f"выгрузка {obj_short(pvd.obj)}", name, line):
                         return {"найдено": hits, "обрезано по лимиту": True, **status()}
-        for pro in direction.pro:
+        for pro in exch.pro:
             if needle in pro.obj_filter.casefold():
-                if add(direction, f"регистрация {obj_short(pro.obj)}", f"ПРО {pro.code}, отбор"):
+                if add(exch, f"регистрация {obj_short(pro.obj)}", f"ПРО {pro.code}, отбор"):
                     return {"найдено": hits, "обрезано по лимиту": True, **status()}
 
     return {"найдено": hits, "всего": len(hits), **status()}
@@ -445,7 +445,7 @@ def _matching_lines(code: str, needle: str, limit: int = 3) -> list[str]:
 
 
 @mcp.tool
-def ozhidaniya_priemnika(dokument: str, napravlenie: str, obyekt: str = "") -> dict:
+def receiver_fields(document: str, direction: str, obj: str = "") -> dict:
     """Что правила ждут от конфигурации приёмника: реквизиты и их типы.
 
     Нужен, чтобы сверить с реальным составом объекта в конфигурации приёмника
@@ -454,23 +454,23 @@ def ozhidaniya_priemnika(dokument: str, napravlenie: str, obyekt: str = "") -> d
 
     По умолчанию показывает документы приёмника, а справочники — только списком
     имён, иначе ответ разрастается. Чтобы получить состав конкретного объекта,
-    передайте его в obyekt («Номенклатура», «ПриобретениеТоваровУслуг»).
+    передайте его в obj («Номенклатура», «ПриобретениеТоваровУслуг»).
     """
     ix = index()
-    direction = ix.resolve(napravlenie)
-    pvds = ix.pvd_for(direction, dokument)
+    exch = ix.resolve(direction)
+    pvds = ix.pvd_for(exch, document)
     if not pvds:
-        raise LookupError(f"в направлении {direction.title} нет правил выгрузки «{dokument}»")
+        raise LookupError(f"в направлении {exch.title} нет правил выгрузки «{document}»")
 
     wanted: set[str] = set()
     for pvd in pvds:
         for name in pvd.pko_calls:
             wanted.add(name)
-            wanted.update(ix.cascades(direction, name))
+            wanted.update(ix.cascades(exch, name))
 
     by_object: dict[str, dict[str, dict]] = {}
     for name in sorted(wanted):
-        pko = direction.pko.get(name)
+        pko = exch.pko.get(name)
         if pko is None or pko.disabled:
             continue
         target = by_object.setdefault(pko.dst, {})
@@ -495,15 +495,15 @@ def ozhidaniya_priemnika(dokument: str, napravlenie: str, obyekt: str = "") -> d
             out.append(line)
         return out
 
-    if obyekt:
-        matches = [o for o in by_object if obj_short(o).casefold() == obyekt.casefold()]
+    if obj:
+        matches = [o for o in by_object if obj_short(o).casefold() == obj.casefold()]
         if not matches:
             raise LookupError(
-                f"среди объектов приёмника «{obyekt}» нет. "
+                f"среди объектов приёмника «{obj}» нет. "
                 f"Есть: {', '.join(sorted(obj_short(o) for o in by_object))}"
             )
         return {
-            "направление": direction.title,
+            "направление": exch.title,
             "объект приёмника": matches[0],
             "реквизиты": fields_of(matches[0]),
             **status(),
@@ -512,8 +512,8 @@ def ozhidaniya_priemnika(dokument: str, napravlenie: str, obyekt: str = "") -> d
     documents = {o: f for o, f in by_object.items() if o.startswith("Документ")}
     others = sorted(obj_short(o) for o in by_object if not o.startswith("Документ"))
     return {
-        "направление": direction.title,
-        "документ": dokument,
+        "направление": exch.title,
+        "документ": document,
         "документы приёмника": [
             {"объект": obj_short(obj), "реквизиты": fields_of(obj)}
             for obj in sorted(documents)
@@ -521,13 +521,13 @@ def ozhidaniya_priemnika(dokument: str, napravlenie: str, obyekt: str = "") -> d
         "справочники и прочее (состав по запросу)": others,
         "как пользоваться": "Возьмите состав этих объектов из конфигурации приёмника и "
         "сравните: чего нет, что переименовано, у чего другой тип. Состав справочника — "
-        "повторный вызов с параметром obyekt.",
+        "повторный вызов с параметром obj.",
         **status(),
     }
 
 
 @mcp.tool
-def obnovit(parol: str) -> dict:
+def refresh_rules(password: str) -> dict:
     """Перечитать правила из GitLab прямо сейчас, не дожидаясь опроса.
 
     Правила и так подтягиваются автоматически. Инструмент нужен, когда только
@@ -536,7 +536,7 @@ def obnovit(parol: str) -> dict:
     """
     if not REFRESH_PASSWORD:
         raise PermissionError("обновление по запросу отключено: пароль не задан в настройках")
-    if parol != REFRESH_PASSWORD:
+    if password != REFRESH_PASSWORD:
         raise PermissionError("неверный пароль")
     return refresh(force=True)
 
