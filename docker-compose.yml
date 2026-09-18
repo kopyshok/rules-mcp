@@ -5,6 +5,7 @@
 services:
   rules-mcp:
     build: ./rules-mcp
+    image: rules-mcp:2.1.0                     # версия из CHANGELOG.md — менять вместе с ней
     environment:
       GITLAB_REPO: https://gitlab.example.ru/exchange/rules.git
       GITLAB_TOKEN: ${GITLAB_TOKEN}            # deploy-токен, область read_repository

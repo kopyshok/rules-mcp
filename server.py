@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+__version__ = "2.1.0"  # см. CHANGELOG.md
+
 import os
 import shutil
 import subprocess
@@ -27,7 +29,19 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastmcp import FastMCP
 
-from rules_index import Index, obj_short
+from query_extract import extract_queries
+from rules_index import (
+    PROP_HANDLER,
+    Index,
+    all_props,
+    branch_call_places,
+    handler_names,
+    handler_text,
+    obj_short,
+    page_lines,
+    prop_handler,
+    prop_target,
+)
 
 # ---------------------------------------------------------------------------
 # Настройки
@@ -150,6 +164,7 @@ def refresh(force: bool = False) -> dict:
 
 def status() -> dict:
     return {
+        "версия сервиса": __version__,
         "версия правил": _state["версия"],
         "проверялось": _state["обновлено"],
         **({"внимание": f"обновление не проходит: {_state['ошибка']}"} if _state["ошибка"] else {}),
@@ -230,6 +245,12 @@ def trace_document(document: str, direction: str) -> dict:
     к выгрузке, какие правила конвертации вызываются, какие документы возникают
     у приёмника, и какие ещё документы создаются каскадами через свойства
     (их не видно в самих ветках выгрузки).
+
+    У каждого вызываемого правила — где стоит вызов: обработчик и строка, по
+    ним читайте get_rule_handler. Для вызовов через общие алгоритмы — строка в
+    ветке, где зовётся алгоритм, и строка в алгоритме, где вызывается правило.
+    У ветки — откуда метки процессов: свои или пришли от вызываемых правил.
+    Пришедшая метка не доказывает, что такая выгрузка действует.
     """
     ix = index()
     exch = ix.resolve(direction)
@@ -290,21 +311,48 @@ def trace_document(document: str, direction: str) -> dict:
                     "документ приёмника": obj_short(pko.dst) if pko else "—",
                     "каскадом создаются документы": doc_cascades,
                     "всего подчинённых правил": len(cascades),
+                    **branch_call_places(pvd, name),
                 }
             )
             if pko and not pko.disabled:
                 receivers.setdefault(obj_short(pko.dst), set()).add(name)
                 for extra in doc_cascades:
                     receivers.setdefault(extra, set()).add(f"каскад из {name}")
-        branches.append(
-            {
-                "код": pvd.code,
-                "отключено": pvd.disabled,
-                "процессы": ix.pvd_blocks(exch, pvd),
-                "обработчики": sorted(pvd.handlers),
-                "вызываемые правила конвертации": called,
-            }
-        )
+        # Вызов может стоять не в самой ветке, а в общем алгоритме, который она
+        # зовёт. В коде ветки его не видно, поэтому показываем отдельно.
+        via_algorithms = ix.algorithms_used(exch, "\n".join(pvd.handlers.values()))
+        for algorithm, names in via_algorithms.items():
+            for name in names:
+                pko = exch.pko.get(name)
+                if pko is None or pko.disabled:
+                    continue
+                receivers.setdefault(obj_short(pko.dst), set()).add(f"через алгоритм {algorithm}")
+                # Каскады у них такие же, как у вызванных напрямую.
+                for child in ix.cascades(exch, name):
+                    sub = exch.pko.get(child)
+                    if sub is not None and sub.dst.startswith("Документ"):
+                        receivers.setdefault(obj_short(sub.dst), set()).add(
+                            f"каскад из {name} (через алгоритм {algorithm})"
+                        )
+        branch = {
+            "код": pvd.code,
+            "отключено": pvd.disabled,
+            "процессы": ix.pvd_blocks(exch, pvd),
+            "откуда процессы": ix.pvd_block_sources(exch, pvd),
+            "обработчики": sorted(pvd.handlers),
+            "вызываемые правила конвертации": called,
+        }
+        if via_algorithms:
+            branch["правила конвертации из общих алгоритмов"] = via_algorithms
+            branch["где вызываются правила из общих алгоритмов"] = ix.algorithm_call_places(
+                exch, pvd, "ПВД"
+            )
+        if pvd.custom_selection:
+            branch["внимание"] = (
+                f"отбор произвольным алгоритмом: объект выборки {obj_short(pvd.obj)}"
+                " декоративен, настоящий отбор задан запросом в обработчике"
+            )
+        branches.append(branch)
 
     return {
         "направление": exch.title,
@@ -349,8 +397,11 @@ def get_conversion_rule(rule: str, direction: str, verbose: bool = False) -> dic
             item["поле поиска"] = True
         if prop.disabled:
             item["отключено"] = True
+        if prop.param:
+            item["параметр"] = prop.param
         if prop.handler:
             item["есть обработчик"] = True
+            item["код реквизита"] = prop.code
         return item
 
     card = {
@@ -375,73 +426,256 @@ def get_conversion_rule(rule: str, direction: str, verbose: bool = False) -> dic
         **status(),
     }
     if verbose:
-        card["тексты обработчиков"] = pko.handlers
+        # Молча обрезанного текста быть не должно: у самых крупных правил
+        # обработчики вместе дают под 63 000 знаков и ответ перестаёт доходить.
+        spent = sum(len(t) for t in pko.handlers.values())
+        if spent > _HANDLER_TEXT_BUDGET:
+            card["тексты обработчиков"] = f"не вложены: вместе они {spent} знаков"
+            card["размеры обработчиков"] = {
+                name: len(pko.handlers[name].splitlines())
+                for name in handler_names("ПКО", pko.handlers)
+            }
+            card["как прочитать"] = (
+                "get_rule_handler с этим правилом и нужным обработчиком — он отдаёт"
+                " текст страницами и сообщает, всё ли показано"
+            )
+        else:
+            card["тексты обработчиков"] = pko.handlers
     return card
 
 
 @mcp.tool
-def search_rules(query: str, direction: str = "", limit: int = 40) -> dict:
+def get_rule_handler(
+    rule: str,
+    direction: str,
+    rule_kind: str = "",
+    handler: str = "",
+    start_line: int = 1,
+    max_lines: int = 500,
+    prop: str = "",
+) -> dict:
+    """Полный текст обработчика правила — постранично, с номерами строк.
+
+    Условия, по которым ветка выгрузки выбирает правило конвертации, лежат в
+    коде обработчиков. По одной найденной строке их восстановить нельзя, нужен
+    весь текст.
+
+    Правило можно назвать кодом, наименованием или именем объекта: у правил
+    регистрации коды числовые, и «ПеремещениеТоваров» для них понятнее, чем
+    «000000039». Подошло несколько правил — в ответе перечень, выберите код.
+
+    Вид правила (ПВД, ПКО, ПРО, Алгоритм, Запрос) можно не указывать, если и так
+    однозначно. Коды веток выгрузки и правил конвертации местами совпадают —
+    тогда вид спросят. Читаются и общие алгоритмы с именованными запросами: у
+    них один обработчик с именем «Текст».
+
+    Без параметра handler возвращает перечень обработчиков правила и размер
+    каждого — с этого стоит начинать. Если показано не всё, в ответе будет
+    «следующая строка»: повторный вызов с этим start_line даёт продолжение.
+
+    prop — обработчик отдельного реквизита правила конвертации: там лежит
+    условие заполнения реквизита, отдельное от условий выбора правила.
+    Реквизит называется кодом (надёжно) или именем приёмника (если оно в
+    правиле одно). Обработчик у реквизита один, ПередВыгрузкой: handler можно
+    не указывать, а указанный другой — ошибка. Какие реквизиты имеют
+    обработчики, видно в перечне обработчиков правила конвертации.
+    """
+    ix = index()
+    exch = ix.resolve(direction)
+    kind, found = ix.find_rule(exch, rule, rule_kind or ("ПКО" if prop else ""))
+    if prop and kind != "ПКО":
+        raise LookupError("обработчики реквизитов есть только у правил конвертации (ПКО)")
+    head = {
+        "направление": exch.title,
+        "вид правила": kind,
+        "правило": found.code,
+        "наименование": found.name,
+        "отключено": found.disabled,
+    }
+    if prop:
+        section, row = prop_handler(found, prop, handler)
+        return {
+            **head,
+            "реквизит": prop_target(row),
+            "код реквизита": row.code,
+            **({"табличная часть": section} if section else {}),
+            "обработчик": PROP_HANDLER,
+            **page_lines(row.handler, start_line, max_lines),
+            **status(),
+        }
+    if not handler:
+        listing = {
+            **head,
+            "обработчики": {
+                name: len(found.handlers[name].splitlines())
+                for name in handler_names(kind, found.handlers)
+            },
+            "подсказка": "Текст — повторный вызов с параметром handler.",
+        }
+        if kind == "ПКО":
+            # Без этого об обработчиках реквизитов не догадаться: их больше,
+            # чем обработчиков самих правил.
+            own = {
+                row.code: f"{section + '.' if section else ''}{prop_target(row)}, "
+                f"строк {len(row.handler.splitlines())}"
+                for section, row in all_props(found)
+                if row.handler
+            }
+            if own:
+                listing["обработчики реквизитов"] = own
+                listing["подсказка"] += " Обработчик реквизита — параметр prop с его кодом."
+        return {**listing, **status()}
+
+    name, text = handler_text(found, kind, handler)
+    return {**head, "обработчик": name, **page_lines(text, start_line, max_lines), **status()}
+
+
+_QUERY_TEXT_BUDGET = 60_000  # дальше ответ перестаёт помещаться в чат
+_HANDLER_TEXT_BUDGET = 40_000
+
+
+def _query_card(name: str, use) -> dict:
+    """Одно использование запроса: где задан, чем выполнен, из чего состоит."""
+    card = {
+        "обработчик": name,
+        "переменная": use.variable,
+        "строка текста": use.assign_line,
+        "способ выполнения": use.exec_kind or "не найден",
+        "извлечён полностью": use.complete,
+        "параметры": [
+            {"имя": p.name, "выражение": p.expression, "строка": p.line} for p in use.params
+        ],
+        "пакет": [
+            {
+                "номер": q.index,
+                "создаёт таблицу": q.temp_table,
+                "зависит от": q.depends_on,
+                "результат в переменных": q.result_vars,
+                "текст": q.text,
+            }
+            for q in use.packet
+        ],
+        "текст запроса": use.text,
+    }
+    if use.exec_line:
+        card["строка выполнения"] = use.exec_line
+    if use.unresolved:
+        card["номер не определён"] = [
+            {"переменная": u.variable, "выражение": u.expression, "строка": u.line}
+            for u in use.unresolved
+        ]
+    return card
+
+
+@mcp.tool
+def get_rule_queries(
+    rule: str,
+    direction: str,
+    rule_kind: str = "",
+    handler: str = "",
+) -> dict:
+    """Запросы из обработчиков правила: пакет, параметры, временные таблицы.
+
+    Разбирает код обработчика и достаёт запросы: делит пакет на отдельные
+    запросы, сопоставляет `Результат[n]` с номером запроса в пакете, показывает,
+    какая временная таблица где создаётся и от каких зависит.
+
+    Текст, который не сводится к строковому литералу (собран через
+    СтрСоединить, склейкой или взят из переменной), полным не выдаётся: такой
+    запрос помечен неполным, и его надо читать глазами через get_rule_handler.
+    Номер элемента пакета, вычисляемый в коде, не угадывается, а выносится
+    отдельно как неопределённый.
+    """
+    ix = index()
+    exch = ix.resolve(direction)
+    kind, found = ix.find_rule(exch, rule, rule_kind)
+    names = (
+        [handler_text(found, kind, handler)[0]]
+        if handler
+        else handler_names(kind, found.handlers)
+    )
+
+    cards: list[dict] = []
+    missing: list[dict] = []
+    for name in names:
+        for use in extract_queries(found.handlers[name]):
+            if use.complete:
+                cards.append(_query_card(name, use))
+            else:
+                missing.append(
+                    {
+                        "обработчик": name,
+                        "переменная": use.variable,
+                        "строка": use.assign_line,
+                        "причина": use.reason,
+                    }
+                )
+
+    # Тексты запросов объёмные: структуру отдаём всегда, тексты — пока влезают.
+    spent = sum(
+        len(q["текст"] or "") for c in cards for q in c["пакет"]
+    ) + sum(len(c["текст запроса"] or "") for c in cards)
+    dropped = spent > _QUERY_TEXT_BUDGET
+    if dropped:
+        for card in cards:
+            card["текст запроса"] = None
+            for part in card["пакет"]:
+                part["текст"] = None
+
+    return {
+        "направление": exch.title,
+        "вид правила": kind,
+        "правило": found.code,
+        "запросы": cards,
+        **({"не извлечено полностью": missing} if missing else {}),
+        **(
+            {
+                "тексты опущены по размеру": True,
+                "подсказка": "Структура полная, тексты читайте через get_rule_handler"
+                " или запросите один обработчик параметром handler.",
+            }
+            if dropped
+            else {}
+        ),
+        **status(),
+    }
+
+
+@mcp.tool
+def search_rules(
+    query: str,
+    direction: str = "",
+    rule_kind: str = "",
+    rule: str = "",
+    handler: str = "",
+    limit: int = 40,
+    lines_per_handler: int = 5,
+) -> dict:
     """Где в правилах упоминается реквизит, алгоритм или фрагмент логики.
 
     Ищет по соответствиям реквизитов, отборам регистрации и текстам
-    обработчиков. Без направления — по всем сразу. Нужен, когда неизвестно,
-    в каком правиле искать: «где вообще трогается СкладОрдер».
+    обработчиков всех видов правил. Без направления — по всем сразу. Нужен,
+    когда неизвестно, в каком правиле искать: «где вообще трогается СкладОрдер».
+
+    Отвечает фрагментами строк, а не логикой целиком. По одной строке судить о
+    том, при каких условиях вызывается правило конвертации, нельзя: у каждого
+    попадания есть номер строки, по нему читайте обработчик через
+    get_rule_handler. Закомментированный код в выдачу не попадает.
+
+    rule — код, наименование или имя объекта правила: правило регистрации
+    можно назвать именем документа. Подошло несколько правил — ищется по всем.
+    Правила нет ни в одном направлении — ошибка с похожими.
     """
     ix = index()
-    targets = (
-        [ix.resolve(direction)] if direction else list(ix.directions.values())
-    )
-    needle = query.casefold()
-    hits: list[dict] = []
-
-    def add(exch, where: str, what: str, snippet: str = "") -> bool:
-        hits.append(
-            {
-                "направление": exch.key,
-                "где": where,
-                "что": what,
-                **({"фрагмент": snippet} if snippet else {}),
-            }
-        )
-        return len(hits) >= limit
-
-    for exch in targets:
-        for pko in exch.pko.values():
-            props = list(pko.props) + [p for s in pko.sections for p in s.props]
-            for prop in props:
-                if needle in f"{prop.src} {prop.dst} {prop.dst_type}".casefold():
-                    if add(
-                        exch,
-                        f"правило конвертации {pko.code}",
-                        f"{prop.src or '—'} → {prop.dst} ({prop.dst_type})",
-                    ):
-                        return {"найдено": hits, "обрезано по лимиту": True, **status()}
-            for name, code in pko.handlers.items():
-                for line in _matching_lines(code, needle):
-                    if add(exch, f"правило конвертации {pko.code}", name, line):
-                        return {"найдено": hits, "обрезано по лимиту": True, **status()}
-        for pvd in exch.pvd:
-            for name, code in pvd.handlers.items():
-                for line in _matching_lines(code, needle):
-                    if add(exch, f"выгрузка {obj_short(pvd.obj)}", name, line):
-                        return {"найдено": hits, "обрезано по лимиту": True, **status()}
-        for pro in exch.pro:
-            if needle in pro.obj_filter.casefold():
-                if add(exch, f"регистрация {obj_short(pro.obj)}", f"ПРО {pro.code}, отбор"):
-                    return {"найдено": hits, "обрезано по лимиту": True, **status()}
-
-    return {"найдено": hits, "всего": len(hits), **status()}
-
-
-def _matching_lines(code: str, needle: str, limit: int = 3) -> list[str]:
-    out = []
-    for line in code.splitlines():
-        stripped = line.strip()
-        if needle in stripped.casefold() and not stripped.startswith("//"):
-            out.append(stripped[:200])
-            if len(out) >= limit:
-                break
-    return out
+    targets = [ix.resolve(direction)] if direction else list(ix.directions.values())
+    hits = ix.search(targets, query, rule_kind, rule, handler, limit, lines_per_handler)
+    return {
+        "найдено": hits,
+        "всего": len(hits),
+        **({"обрезано по лимиту": True} if len(hits) >= limit else {}),
+        "подсказка": "Полный текст — get_rule_handler с тем же правилом и обработчиком.",
+        **status(),
+    }
 
 
 @mcp.tool

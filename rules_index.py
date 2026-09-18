@@ -34,6 +34,7 @@ class Prop:
     search: bool
     disabled: bool
     handler: str  # текст ПередВыгрузкой
+    param: str = ""  # ИмяПараметраДляПередачи: значение уходит параметром, а не в реквизит
 
 
 @dataclass(slots=True)
@@ -73,6 +74,16 @@ class Pvd:
     handlers: dict[str, str]
     pko_calls: list[str]
     blocks: list[str]  # функциональные блоки, которыми помечены ветки
+    selection: str = "СтандартнаяВыборка"  # способ отбора данных
+
+    @property
+    def custom_selection(self) -> bool:
+        """Отбор задан запросом в обработчике, а не объектом выборки.
+
+        У таких веток ОбъектВыборки декоративен и врёт: в боевых правилах
+        встречаются ветки, числящиеся за совсем посторонним документом.
+        """
+        return self.selection == "ПроизвольныйАлгоритм"
 
 
 @dataclass(slots=True)
@@ -89,6 +100,24 @@ class Pro:
     vidops: list[str]  # значения ВидОперации, встречающиеся в отборе
 
 
+@dataclass(slots=True)
+class Snippet:
+    """Общий алгоритм или именованный запрос — текст, живущий вне правил.
+
+    В вызовах ПКО он участвует наравне с обработчиками: ветка выгрузки делает
+    `Выполнить(Алгоритмы.Имя)`, а внутри алгоритма стоит ВыгрузитьПоПравилу.
+    Поле handlers с единственным ключом «Текст» — чтобы чтение и поиск работали
+    так же, как для правил, без отдельной ветки кода.
+    """
+
+    code: str
+    name: str
+    disabled: bool
+    handlers: dict[str, str]
+    group: str  # Выгрузка / Загрузка — только у алгоритмов
+    pko_calls: list[str]
+
+
 @dataclass
 class Direction:
     """Одно направление обмена — папка с правилами."""
@@ -100,6 +129,8 @@ class Direction:
     pro: list[Pro] = field(default_factory=list)
     pvd: list[Pvd] = field(default_factory=list)
     pko: dict[str, Pko] = field(default_factory=dict)
+    algorithms: dict[str, Snippet] = field(default_factory=dict)
+    queries: dict[str, Snippet] = field(default_factory=dict)
     raw: str = ""  # текст ExchangeRules.xml для полнотекстового поиска
     raw_reg: str = ""
 
@@ -114,6 +145,7 @@ class Direction:
 _ENUM_RE = re.compile(r"Перечисления\.[А-Яа-яA-Za-z_0-9]+\.([А-Яа-яA-Za-z_0-9]+)")
 _VIDOP_RE = re.compile(r"Перечисления\.ВидыОпераций[А-Яа-я_]*\.([А-Яа-яA-Za-z_0-9]+)")
 _IMYA_PKO_RE = re.compile(r'ИмяПКО\s*=\s*"([^"]+)"')
+_ALG_CALL_RE = re.compile(r"Алгоритмы\.([А-Яа-яA-Za-z_0-9]+)")
 _VYGR_RE = re.compile(r'ВыгрузитьПоПравилу\s*\((?:[^()]|\([^()]*\))*?"([^"]+)"')
 _BLOCK_RES = (
     re.compile(r'_ФБ\s*=\s*"([^"]+)"'),
@@ -251,6 +283,7 @@ def _render_filter(node: ET.Element | None, depth: int = 0) -> list[str]:
 
 
 _PROP_HANDLERS = ("ПередВыгрузкой",)
+_PKO_HANDLERS = ("ПередВыгрузкой", "ПриВыгрузке", "ПослеВыгрузки", "ПриЗагрузке", "ПослеЗагрузки")
 
 
 def _parse_prop(el: ET.Element, inherited_off: bool) -> Prop:
@@ -268,6 +301,7 @@ def _parse_prop(el: ET.Element, inherited_off: bool) -> Prop:
         search=el.get("Поиск", "false") == "true",
         disabled=inherited_off or _disabled(el),
         handler=_text(el, "ПередВыгрузкой"),
+        param=_text(el, "ИмяПараметраДляПередачи"),
     )
 
 
@@ -293,10 +327,7 @@ def _parse_pko(el: ET.Element, off: bool) -> Pko:
                         ],
                     )
                 )
-    handlers = _handlers(
-        el,
-        ("ПередВыгрузкой", "ПриВыгрузке", "ПослеВыгрузки", "ПриЗагрузке", "ПослеЗагрузки"),
-    )
+    handlers = _handlers(el, _PKO_HANDLERS)
     return Pko(
         code=_text(el, "Код"),
         name=_text(el, "Наименование"),
@@ -322,11 +353,63 @@ _PVD_HANDLERS = (
 )
 
 
+def _pko_calls(code: str) -> list[str]:
+    """Имена ПКО, вызываемых из текста. Закомментированное не считается."""
+    active = _uncommented(code)
+    return sorted(set(_IMYA_PKO_RE.findall(active)) | set(_VYGR_RE.findall(active)))
+
+
+def _lines_of(code: str, patterns: tuple[re.Pattern, ...]) -> dict[str, list[int]]:
+    """Имя из первой группы выражения → номера строк, в нумерации page_lines.
+
+    Закомментированные строки опустошаются, а не выбрасываются: номера не
+    сдвигаются. Номер — строка, где стоит само имя, поэтому вызов, разнесённый
+    на несколько строк, указывает на строку с именем правила.
+    """
+    live = "\n".join("" if ln.lstrip().startswith("//") else ln for ln in code.splitlines())
+    out: dict[str, set[int]] = {}
+    for pattern in patterns:
+        for match in pattern.finditer(live):
+            out.setdefault(match.group(1), set()).add(live.count("\n", 0, match.start(1)) + 1)
+    return {name: sorted(lines) for name, lines in sorted(out.items())}
+
+
+def pko_call_lines(code: str) -> dict[str, list[int]]:
+    """Имя ПКО → строки вызовов. Те же выражения, что у _pko_calls."""
+    return _lines_of(code, (_IMYA_PKO_RE, _VYGR_RE))
+
+
+def call_places(rule, kind: str, pko: str) -> list[dict]:
+    """Где в обработчиках правила вызывается ПКО: обработчик и строка, по порядку выполнения."""
+    return [
+        {"обработчик": name, "строка": line}
+        for name in handler_names(kind, rule.handlers)
+        for line in pko_call_lines(rule.handlers[name]).get(pko, [])
+    ]
+
+
+def branch_call_places(pvd: Pvd, pko: str) -> dict:
+    """Поля ответа trace_document о месте вызова ПКО веткой.
+
+    Правило, заданное в свойствах ветки, строки в коде не имеет — это
+    говорится словами, а не пустым списком. У 33 веток корпуса правило
+    задано в свойствах и вдобавок вызывается в коде: тогда список и пометка.
+    """
+    places = call_places(pvd, "ПВД", pko)
+    in_props = pko == pvd.conv_rule
+    if not places:
+        return {
+            "где вызывается": "в коде не вызывается — задано в свойствах ветки, строки нет"
+            if in_props
+            else "строка вызова не найдена"
+        }
+    return {"где вызывается": places, **({"задано и в свойствах ветки": True} if in_props else {})}
+
+
 def _parse_pvd(el: ET.Element, off: bool) -> Pvd:
     handlers = _handlers(el, _PVD_HANDLERS)
     joined = "\n".join(handlers.values())
-    active_code = _uncommented(joined)
-    calls = sorted(set(_IMYA_PKO_RE.findall(active_code)) | set(_VYGR_RE.findall(active_code)))
+    calls = _pko_calls(joined)
     if _text(el, "КодПравилаКонвертации"):
         calls = sorted(set(calls) | {_text(el, "КодПравилаКонвертации")})
     blocks = _extract_blocks(joined)
@@ -339,11 +422,15 @@ def _parse_pvd(el: ET.Element, off: bool) -> Pvd:
         handlers=handlers,
         pko_calls=calls,
         blocks=sorted(blocks),
+        selection=_text(el, "СпособОтбораДанных", "СтандартнаяВыборка"),
     )
 
 
 # ---------------------------------------------------------------------------
 # Разбор ПРО
+
+
+_PRO_HANDLERS = ("ПередОбработкой", "ПриОбработке", "ПриОбработкеДополнительный", "ПослеОбработки")
 
 
 def _parse_pro(el: ET.Element, off: bool) -> Pro:
@@ -356,15 +443,216 @@ def _parse_pro(el: ET.Element, off: bool) -> Pro:
         disabled=off,
         plan_filter=plan_filter,
         obj_filter=obj_filter,
-        handlers=_handlers(
-            el, ("ПередОбработкой", "ПриОбработке", "ПриОбработкеДополнительный", "ПослеОбработки")
-        ),
+        handlers=_handlers(el, _PRO_HANDLERS),
         vidops=sorted(set(_VIDOP_RE.findall(ET.tostring(el, encoding="unicode")))),
     )
 
 
 # ---------------------------------------------------------------------------
+# Чтение текста обработчиков
+
+RULE_KINDS = ("ПВД", "ПКО", "ПРО", "Алгоритм", "Запрос")
+
+#: Вид правила → имена его обработчиков в том порядке, в каком они выполняются.
+#: У алгоритмов и именованных запросов обработчик один, и он весь их текст.
+HANDLER_NAMES: dict[str, tuple[str, ...]] = {
+    "ПВД": _PVD_HANDLERS,
+    "ПКО": _PKO_HANDLERS,
+    "ПРО": _PRO_HANDLERS,
+    "Алгоритм": ("Текст",),
+    "Запрос": ("Текст",),
+}
+
+_PAGE_CAP = 2000  # потолок страницы, чтобы ответ не раздулся до неотправляемого
+
+
+def page_lines(text: str, start_line: int = 1, max_lines: int = 500) -> dict:
+    """Страница текста с номерами строк и честным признаком полноты.
+
+    Нумерация от 1 по `text.splitlines()` — тот же счёт, что у поиска, поэтому
+    номер из выдачи поиска годится сюда без пересчёта. Молча обрезать нельзя:
+    если показано не всё, в ответе есть «следующая строка».
+
+    Тексты обработчиков приходят уже обрезанными по краям, так что завершающий
+    перевод строки в них не встречается и при сборке страниц не теряется.
+    """
+    lines = text.splitlines()
+    total = len(lines)
+    max_lines = max(1, min(max_lines, _PAGE_CAP))
+    if total == 0:
+        return {
+            "всего строк": 0,
+            "с строки": 0,
+            "по строку": 0,
+            "показано строк": 0,
+            "обрезано": False,
+            "текст": "",
+        }
+    start_line = max(1, start_line)
+    if start_line > total:
+        raise ValueError(f"в тексте {total} строк, строки {start_line} в нём нет")
+
+    end = min(start_line + max_lines - 1, total)
+    shown = lines[start_line - 1 : end]
+    page = {
+        "всего строк": total,
+        "с строки": start_line,
+        "по строку": end,
+        "показано строк": len(shown),
+        "обрезано": end < total,
+        "текст": "\n".join(f"{n:5d} | {ln}" for n, ln in enumerate(shown, start_line)),
+    }
+    if page["обрезано"]:
+        page["следующая строка"] = end + 1
+    return page
+
+
+def _rule_label(kind: str, rule) -> str:
+    """Как назвать правило в сообщении об ошибке: один код мало что объясняет."""
+    parts = [f"{kind} {rule.code}"]
+    if rule.name:
+        parts.append(f"«{rule.name}»")
+    obj = obj_short(getattr(rule, "obj", ""))
+    if obj:
+        parts.append(f"объект {obj}")
+    return ", ".join(parts)
+
+
+def handler_names(kind: str, handlers: dict[str, str]) -> list[str]:
+    """Имена обработчиков в порядке выполнения, а не как легли в словарь."""
+    order = HANDLER_NAMES.get(kind, ())
+    return [n for n in order if n in handlers] + [n for n in handlers if n not in order]
+
+
+def handler_text(rule, kind: str, name: str) -> tuple[str, str]:
+    """Обработчик по имени без учёта регистра: (настоящее имя, текст)."""
+    for real, text in rule.handlers.items():
+        if real.casefold() == name.casefold():
+            return real, text
+    have = ", ".join(handler_names(kind, rule.handlers)) or "ни одного"
+    raise LookupError(f"у правила «{rule.code}» нет обработчика «{name}». Есть: {have}")
+
+
+def matching_lines(code: str, needle: str, limit: int = 5) -> list[tuple[int, str, bool]]:
+    """Строки с совпадением: номер, текст (до 200 знаков), признак обрезки.
+
+    Закомментированные строки пропускаются: закомментированный вызов правила
+    активным не считается.
+    """
+    out: list[tuple[int, str, bool]] = []
+    for number, line in enumerate(code.splitlines(), 1):
+        stripped = line.strip()
+        if needle in stripped.casefold() and not stripped.startswith("//"):
+            out.append((number, stripped[:200], len(stripped) > 200))
+            if len(out) >= limit:
+                break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Обработчики реквизитов (ПКС)
+
+#: У реквизита обработчик один — это и есть «условие заполнения реквизита».
+PROP_HANDLER = "ПередВыгрузкой"
+
+
+def all_props(pko: Pko) -> list[tuple[str, Prop]]:
+    """(табличная часть или "", реквизит): сначала шапка, потом табличные части."""
+    return [("", p) for p in pko.props] + [
+        (s.dst or s.name, p) for s in pko.sections for p in s.props
+    ]
+
+
+def prop_target(prop: Prop) -> str:
+    """Куда уходит значение: реквизит приёмника или параметр для подчинённого правила.
+
+    У каждого четвёртого реквизита с обработчиком приёмника нет — значение
+    передаётся параметром, и без этого поле выглядело бы пустым.
+    """
+    if prop.dst:
+        return prop.dst
+    return f"параметр {prop.param}" if prop.param else "без приёмника"
+
+
+def _prop_label(section: str, prop: Prop) -> str:
+    parts = [f"код {prop.code}", f"приёмник {prop_target(prop)}"]
+    if section:
+        parts.append(f"табличная часть {section}")
+    parts.append("есть обработчик" if prop.handler else "без обработчика")
+    return ", ".join(parts)
+
+
+def find_prop(pko: Pko, name: str) -> tuple[str, Prop]:
+    """Реквизит правила конвертации: сперва по коду, потом по имени приёмника.
+
+    Код всегда заполнен и уникален внутри правила. Имя приёмника удобнее, но
+    внутри одного правила повторяется (шапка и табличная часть), поэтому
+    многозначность — ошибка с перечислением, а не выбор наугад.
+    Имя параметра для передачи считается именем приёмника: другого у таких нет.
+    """
+    rows = all_props(pko)
+    needle = name.strip().casefold()
+    for what, match in (
+        ("код", lambda p: p.code.casefold() == needle),
+        ("имя приёмника", lambda p: needle in (p.dst.casefold(), p.param.casefold())),
+    ):
+        found = [(s, p) for s, p in rows if needle and match(p)]
+        if len(found) == 1:
+            return found[0]
+        if found:
+            listed = "; ".join(_prop_label(s, p) for s, p in found)
+            raise LookupError(
+                f"«{name}» — {what} сразу нескольких реквизитов правила {pko.code}: {listed}."
+                " Уточните код реквизита."
+            )
+    near = sorted({p.dst or p.param for _, p in rows if needle in (p.dst or p.param).casefold()})
+    raise LookupError(
+        f"у правила конвертации {pko.code} нет реквизита «{name}»."
+        + (f" Похожие: {', '.join(near[:10])}" if near else "")
+    )
+
+
+def prop_handler(pko: Pko, name: str, handler: str = "") -> tuple[str, Prop]:
+    """Реквизит, у которого есть обработчик: (табличная часть, реквизит).
+
+    handler можно не указывать; указан — обязан быть ПередВыгрузкой, других у
+    реквизита не бывает, и молча подменять чужое имя нельзя.
+    """
+    if handler and handler.casefold() != PROP_HANDLER.casefold():
+        raise LookupError(f"у реквизита один обработчик — {PROP_HANDLER}, а не «{handler}»")
+    section, prop = find_prop(pko, name)
+    if not prop.handler:
+        raise LookupError(
+            f"у реквизита {prop_target(prop)} (код {prop.code}) правила {pko.code} обработчика нет:"
+            " значение переносится прямым сопоставлением"
+        )
+    return section, prop
+
+
+# ---------------------------------------------------------------------------
 # Сборка индекса
+
+
+def _parse_snippets(node: ET.Element | None, tag: str, group: str = "") -> dict[str, Snippet]:
+    """Алгоритмы и именованные запросы. Имя лежит в атрибуте, текст — в теге."""
+    out: dict[str, Snippet] = {}
+    for child in node if node is not None else ():
+        if child.tag == "Группа":
+            out.update(_parse_snippets(child, tag, child.get("Имя", "")))
+        elif child.tag == tag:
+            name = child.get("Имя", "")
+            text = _text(child, "Текст")
+            if not name:
+                continue
+            out[name] = Snippet(
+                code=name,
+                name=name,
+                disabled=_disabled(child),
+                handlers={"Текст": text} if text else {},
+                group=group,
+                pko_calls=_pko_calls(text),
+            )
+    return out
 
 
 def load_direction(folder: Path) -> Direction | None:
@@ -390,6 +678,8 @@ def load_direction(folder: Path) -> Direction | None:
             direction.pko[pko.code] = pko
     for el, off in _walk_rules(root.find("ПравилаВыгрузкиДанных")):
         direction.pvd.append(_parse_pvd(el, off))
+    direction.algorithms = _parse_snippets(root.find("Алгоритмы"), "Алгоритм")
+    direction.queries = _parse_snippets(root.find("Запросы"), "Запрос")
 
     registration = folder / "RegistrationRules.xml"
     if registration.exists():
@@ -480,6 +770,24 @@ class Index:
                 found.update(pko.blocks)
         return sorted(found)
 
+    def pvd_block_sources(self, direction: Direction, pvd: Pvd) -> dict:
+        """Откуда у ветки метки процессов: свои или от вызываемых ПКО, и от каких.
+
+        pvd_blocks сливает оба источника, и метка чужого правила выглядит как
+        действующая выгрузка ветки, даже если своя ветка по ней закомментирована.
+        Объединение «своих» и «пришедших» равно pvd_blocks.
+        """
+        inherited: dict[str, list[str]] = {}
+        for name in pvd.pko_calls:
+            pko = direction.pko.get(name)
+            if pko is not None and not pko.disabled:
+                for block in pko.blocks:
+                    inherited.setdefault(block, []).append(name)
+        return {
+            "свои": sorted(pvd.blocks),
+            "от вызываемых правил": {b: sorted(n) for b, n in sorted(inherited.items())},
+        }
+
     def documents(self, direction: Direction) -> dict[str, dict]:
         """Объекты, по которым в направлении вообще есть правила."""
         docs: dict[str, dict] = {}
@@ -525,6 +833,266 @@ class Index:
             if pko.code.casefold() == needle or pko.name.casefold() == needle:
                 return pko
         return None
+
+    @staticmethod
+    def _check_kind(kind: str) -> None:
+        """Опечатка в виде правила должна быть ошибкой, а не пустой выдачей."""
+        if kind and kind not in RULE_KINDS:
+            raise LookupError(f"вид правила «{kind}» неизвестен. Бывают: {', '.join(RULE_KINDS)}")
+
+    def _pools(self, direction: Direction, kind: str = "") -> dict[str, list]:
+        """Правила направления по видам. Пустой вид — все три."""
+        self._check_kind(kind)
+        pools: dict[str, list] = {
+            "ПВД": list(direction.pvd),
+            "ПКО": list(direction.pko.values()),
+            "ПРО": list(direction.pro),
+            "Алгоритм": list(direction.algorithms.values()),
+            "Запрос": list(direction.queries.values()),
+        }
+        return pools if not kind else {kind: pools[kind]}
+
+    def find_rule(self, direction: Direction, code: str, kind: str = "") -> tuple[str, object]:
+        """Правило по коду, наименованию или объекту: (вид правила, само правило).
+
+        У правил регистрации коды числовые («000000072») — назвать такое правило
+        человек не может, поэтому в ход идут ещё наименование и имя объекта.
+        Подошло несколько — просим уточнить и перечисляем, а не выбираем сами.
+        """
+        pools = self._pools(direction, kind)
+        what, hint, found = self._matching_rules(pools, code.casefold())
+        if len(found) == 1:
+            return found[0]
+        if found:
+            listed = "; ".join(_rule_label(k, r) for k, r in found)
+            raise LookupError(f"«{code}» — это {what} сразу нескольких правил: {listed}. {hint}")
+        near = self._near(pools, code.casefold())
+        raise LookupError(
+            f"правила «{code}» в направлении {direction.title} нет."
+            + (f" Похожие: {', '.join(near[:10])}" if near else "")
+        )
+
+    @staticmethod
+    def _matching_rules(pools: dict[str, list], needle: str) -> tuple[str, str, list]:
+        """Правила по первому сработавшему признаку: (признак, подсказка, [(вид, правило)]).
+
+        Признаки по старшинству: код, наименование, короткое имя объекта.
+        Ничего не нашлось — ("", "", []).
+        """
+        for what, hint, match in (
+            # Совпал код — уточнять его бессмысленно, он у всех один: нужен вид.
+            ("код", f"Уточните вид правила: {', '.join(RULE_KINDS)}.",
+             lambda r: r.code.casefold() == needle),
+            ("наименование", "Уточните код нужного.",
+             lambda r: r.name.casefold() == needle),
+            ("объект", "Уточните код нужного.",
+             lambda r: obj_short(getattr(r, "obj", "")).casefold() == needle),
+        ):
+            found = [(kind, rule) for kind, rules in pools.items() for rule in rules if match(rule)]
+            if found:
+                return what, hint, found
+        return "", "", []
+
+    @staticmethod
+    def _near(pools: dict[str, list], needle: str) -> list[str]:
+        """Коды и наименования, содержащие искомое, — для текста ошибки."""
+        return sorted(
+            {r.code for rules in pools.values() for r in rules if needle in r.code.casefold()}
+            | {r.name for rules in pools.values() for r in rules if needle in r.name.casefold()}
+        )
+
+    def search(
+        self,
+        targets: list[Direction],
+        query: str,
+        kind: str = "",
+        rule: str = "",
+        handler: str = "",
+        limit: int = 40,
+        lines_per_handler: int = 5,
+    ) -> list[dict]:
+        """Где упоминается реквизит, алгоритм или фрагмент логики.
+
+        Ищет по соответствиям реквизитов, отборам регистрации, текстам
+        обработчиков всех видов правил и обработчикам реквизитов правил
+        конвертации. Фильтры складываются по «и». Каждое попадание в коде несёт
+        номер строки, годный для page_lines.
+
+        Попадание в обработчике реквизита несёт ещё «реквизит» и «код
+        реквизита»; фильтр handler для них — ПередВыгрузкой. Отдельного фильтра
+        по реквизиту нет: такой обработчик не длиннее 66 строк, его проще прочитать.
+
+        Отбор rule понимает то же, что find_rule: код, наименование, имя
+        объекта — и разрешается в каждом направлении отдельно. Подошло несколько
+        правил — ищем по всем: это отбор, а не адресация одного правила.
+        Не нашлось ни в одном направлении — LookupError с похожими, как у
+        опечатки в виде правила.
+        """
+        self._check_kind(kind)
+        needle = query.casefold()
+        wanted_handler = handler.casefold()
+        hits: list[dict] = []
+
+        allowed: dict[str, set[tuple[str, str]]] = {}
+        if rule:
+            near: set[str] = set()
+            for exch in targets:
+                pools = self._pools(exch, kind)
+                found = self._matching_rules(pools, rule.casefold())[2]
+                allowed[exch.key] = {(kind_, r.code) for kind_, r in found}
+                if not found:
+                    near.update(self._near(pools, rule.casefold()))
+            if not any(allowed.values()):
+                raise LookupError(
+                    f"правила «{rule}» нет ни в одном направлении поиска."
+                    + (f" Похожие: {', '.join(sorted(near)[:10])}" if near else "")
+                )
+
+        def suits(exch: Direction, kind_: str, code: str) -> bool:
+            if kind and kind != kind_:
+                return False
+            return not rule or (kind_, code) in allowed[exch.key]
+
+        def suits_handler(name: str) -> bool:
+            return not wanted_handler or name.casefold() == wanted_handler
+
+        def add(exch: Direction, kind_: str, code: str, where: str, **rest) -> bool:
+            hits.append(
+                {"направление": exch.key, "вид правила": kind_, "правило": code, "где": where, **rest}
+            )
+            return len(hits) >= limit
+
+        def add_code(
+            exch: Direction, kind_: str, code: str, where: str, name: str, text: str, **extra
+        ) -> bool:
+            for number, fragment, cut in matching_lines(text, needle, lines_per_handler):
+                item = {**extra, "обработчик": name, "строка": number, "фрагмент": fragment}
+                if cut:
+                    item["фрагмент обрезан"] = True
+                if add(exch, kind_, code, where, **item):
+                    return True
+            return False
+
+        for exch in targets:
+            for pko in exch.pko.values():
+                if not suits(exch, "ПКО", pko.code):
+                    continue
+                where = f"правило конвертации {pko.code}"
+                # Соответствия реквизитов — не обработчик: при отборе по
+                # обработчику они только шумят.
+                if not wanted_handler:
+                    props = list(pko.props) + [p for s in pko.sections for p in s.props]
+                    for prop in props:
+                        if needle in f"{prop.src} {prop.dst} {prop.dst_type}".casefold():
+                            what = f"{prop.src or '—'} → {prop.dst} ({prop.dst_type})"
+                            if add(exch, "ПКО", pko.code, where, что=what):
+                                return hits
+                for name, text in pko.handlers.items():
+                    if suits_handler(name) and add_code(exch, "ПКО", pko.code, where, name, text):
+                        return hits
+                # Обработчики реквизитов: там живёт условие заполнения реквизита.
+                if not suits_handler(PROP_HANDLER):
+                    continue
+                for section, prop in all_props(pko):
+                    if not prop.handler:
+                        continue
+                    target = prop_target(prop)
+                    extra = {"реквизит": target, "код реквизита": prop.code}
+                    if section:
+                        extra["табличная часть"] = section
+                    shown = f"{section}.{target}" if section else target
+                    if add_code(exch, "ПКО", pko.code, f"{where}, реквизит {shown}",
+                                PROP_HANDLER, prop.handler, **extra):
+                        return hits
+
+            for pvd in exch.pvd:
+                if not suits(exch, "ПВД", pvd.code):
+                    continue
+                where = f"выгрузка {obj_short(pvd.obj)}"
+                for name, text in pvd.handlers.items():
+                    if suits_handler(name) and add_code(exch, "ПВД", pvd.code, where, name, text):
+                        return hits
+
+            for pro in exch.pro:
+                if not suits(exch, "ПРО", pro.code):
+                    continue
+                where = f"регистрация {obj_short(pro.obj)}"
+                if not wanted_handler and needle in pro.obj_filter.casefold():
+                    if add(exch, "ПРО", pro.code, where, что="отбор по свойствам объекта"):
+                        return hits
+                for name, text in pro.handlers.items():
+                    if suits_handler(name) and add_code(exch, "ПРО", pro.code, where, name, text):
+                        return hits
+
+            for kind_, pool, label in (
+                ("Алгоритм", exch.algorithms, "общий алгоритм"),
+                ("Запрос", exch.queries, "именованный запрос"),
+            ):
+                for snip in pool.values():
+                    if not suits(exch, kind_, snip.code):
+                        continue
+                    where = f"{label} {snip.code}"
+                    for name, text in snip.handlers.items():
+                        if suits_handler(name) and add_code(
+                            exch, kind_, snip.code, where, name, text
+                        ):
+                            return hits
+
+        return hits
+
+    def algorithms_used(
+        self, direction: Direction, code: str, seen: set[str] | None = None
+    ) -> dict[str, list[str]]:
+        """Общие алгоритмы, вызываемые из текста, и спрятанные в них вызовы ПКО.
+
+        Ветка выгрузки зовёт алгоритм через `Выполнить(Алгоритмы.Имя)`, а внутри
+        алгоритма может стоять ВыгрузитьПоПравилу. В самой ветке такого вызова не
+        видно, поэтому без этого обхода часть документов приёмника теряется.
+        Алгоритмы зовут друг друга, поэтому идём вглубь.
+        """
+        seen = seen if seen is not None else set()
+        out: dict[str, list[str]] = {}
+        for name in sorted(set(_ALG_CALL_RE.findall(_uncommented(code)))):
+            snippet = direction.algorithms.get(name)
+            if snippet is None or name in seen:
+                continue
+            seen.add(name)
+            if snippet.pko_calls:
+                out[name] = snippet.pko_calls
+            out.update(self.algorithms_used(direction, "\n".join(snippet.handlers.values()), seen))
+        return out
+
+    def algorithm_call_places(self, direction: Direction, rule, kind: str) -> list[dict]:
+        """Вызовы ПКО из общих алгоритмов с адресами — два звена цепочки.
+
+        Первое — где правило зовёт алгоритм (обработчик и строки), последнее —
+        где в алгоритме стоит вызов ПКО. Промежуточные алгоритмы не
+        показываются: путь целиком строить незачем, оба конца читаются напрямую.
+        """
+        out: list[dict] = []
+        for name in handler_names(kind, rule.handlers):
+            for first, lines in _lines_of(rule.handlers[name], (_ALG_CALL_RE,)).items():
+                snippet = direction.algorithms.get(first)
+                if snippet is None:
+                    continue
+                text = "\n".join(snippet.handlers.values())
+                reached = {first: snippet.pko_calls} if snippet.pko_calls else {}
+                reached.update(self.algorithms_used(direction, text, {first}))
+                for last, calls in reached.items():
+                    inner = pko_call_lines("\n".join(direction.algorithms[last].handlers.values()))
+                    for pko in calls:
+                        out.append(
+                            {
+                                "правило конвертации": pko,
+                                "вызов в алгоритме": {"алгоритм": last, "строки": inner.get(pko, [])},
+                                "правило зовёт алгоритм": {
+                                    "алгоритм": first,
+                                    "обработчик": name,
+                                    "строки": lines,
+                                },
+                            }
+                        )
+        return out
 
     def carried_by(self, direction: Direction, obj: str) -> list[dict]:
         """Правила конвертации, переносящие объект, у которого нет своей выгрузки.
