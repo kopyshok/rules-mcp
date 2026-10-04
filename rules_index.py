@@ -31,10 +31,11 @@ class Prop:
     dst_type: str
     dst_kind: str  # Реквизит / Свойство / ...
     conv_rule: str  # подчинённое ПКО (каскад)
-    search: bool
+    search: bool  # «Поиск» или «Обязательное»: БСП кладёт оба в свойства поиска
     disabled: bool
-    handler: str  # текст ПередВыгрузкой
+    handlers: dict[str, str]  # ПередВыгрузкой, ПриВыгрузке, ПослеВыгрузки
     param: str = ""  # ИмяПараметраДляПередачи: значение уходит параметром, а не в реквизит
+    flags: frozenset[str] = frozenset()  # Обязательное, ПолучитьИзВходящихДанных, НеЗамещать
 
 
 @dataclass(slots=True)
@@ -45,6 +46,9 @@ class Section:
     src: str
     dst: str
     props: list[Prop]
+    code: str = ""
+    disabled: bool = False
+    handlers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -60,6 +64,7 @@ class Pko:
     sections: list[Section]
     handlers: dict[str, str]
     blocks: list[str]  # функциональные блоки, которыми помечено правило
+    flags: frozenset[str] = frozenset()  # булевы признаки ПКО со значением Истина
 
 
 @dataclass(slots=True)
@@ -75,13 +80,17 @@ class Pvd:
     pko_calls: list[str]
     blocks: list[str]  # функциональные блоки, которыми помечены ветки
     selection: str = "СтандартнаяВыборка"  # способ отбора данных
+    # Код более ранней включённой ветки на тот же объект. БСП ищет ветку для
+    # объекта из очереди по типу и берёт первую найденную, эта не исполняется.
+    shadowed_by: str = ""
 
     @property
     def custom_selection(self) -> bool:
-        """Отбор задан запросом в обработчике, а не объектом выборки.
+        """Способ отбора «произвольный алгоритм».
 
-        У таких веток ОбъектВыборки декоративен и врёт: в боевых правилах
-        встречаются ветки, числящиеся за совсем посторонним документом.
+        В обмене через план обмена он не исполняется: БСП берёт объекты из
+        очереди узла и ищет ветку по их типу, так что объект выборки — это
+        пусковой тип, а не декорация. Выборка из обработчика не используется.
         """
         return self.selection == "ПроизвольныйАлгоритм"
 
@@ -98,6 +107,7 @@ class Pro:
     obj_filter: str  # отбор по свойствам объекта, человекочитаемо
     handlers: dict[str, str]
     vidops: list[str]  # значения ВидОперации, встречающиеся в отборе
+    unload_mode: str = ""  # реквизит узла с режимом выгрузки («при необходимости» и др.)
 
 
 @dataclass(slots=True)
@@ -116,6 +126,7 @@ class Snippet:
     handlers: dict[str, str]
     group: str  # Выгрузка / Загрузка — только у алгоритмов
     pko_calls: list[str]
+    on_import: bool = False  # ИспользуетсяПриЗагрузке: есть только при загрузке, иначе только при выгрузке
 
 
 @dataclass
@@ -131,8 +142,15 @@ class Direction:
     pko: dict[str, Pko] = field(default_factory=dict)
     algorithms: dict[str, Snippet] = field(default_factory=dict)
     queries: dict[str, Snippet] = field(default_factory=dict)
+    conversion: Snippet | None = None  # события уровня всей конвертации, код «Конвертация»
+    duplicates: list[tuple[str, str]] = field(default_factory=list)  # (вид, код): повтор перезаписал первое
     raw: str = ""  # текст ExchangeRules.xml для полнотекстового поиска
     raw_reg: str = ""
+    findings: list[dict] | None = None  # замечания проверки, считаются по первому запросу
+    # Тип → авторегистрация, по снимку состава плана в правилах регистрации. Снимок
+    # делает КД при выгрузке правил, БСП его не читает — он может отставать от
+    # конфигурации. None — снимка нет (или нет самих правил регистрации).
+    plan_content: dict[str, bool] | None = None
 
     @property
     def title(self) -> str:
@@ -208,16 +226,22 @@ def _extract_blocks(code: str) -> list[str]:
     return sorted(found)
 
 
-def _walk_rules(node: ET.Element | None, inherited_off: bool = False):
-    """Обходит дерево Группа/Правило, помня отключённость групп-родителей."""
+def _walk_rules(node: ET.Element | None):
+    """Обходит дерево Группа/Правило: (правило, отключено ли оно само).
+
+    Отключённость группы не наследуется. БСП читает правила конвертации,
+    выгрузки и регистрации, не глядя на группы (БСП 2.3:
+    ЗагрузитьПравилаКонвертации, ЗагрузитьПравилаВыгрузки,
+    ЗагрузитьГруппуПравилРегистрации), и правило выключенной группы работает.
+    У групп свойств внутри ПКО — иначе, там отключение действует (_parse_pko).
+    """
     if node is None:
         return
     for child in node:
-        off = inherited_off or _disabled(child)
         if child.tag == "Правило":
-            yield child, off
+            yield child, _disabled(child)
         elif child.tag == "Группа":
-            yield from _walk_rules(child, off)
+            yield from _walk_rules(child)
 
 
 def _handlers(el: ET.Element, names: tuple[str, ...]) -> dict[str, str]:
@@ -282,13 +306,43 @@ def _render_filter(node: ET.Element | None, depth: int = 0) -> list[str]:
 # Разбор ПКО
 
 
-_PROP_HANDLERS = ("ПередВыгрузкой",)
-_PKO_HANDLERS = ("ПередВыгрузкой", "ПриВыгрузке", "ПослеВыгрузки", "ПриЗагрузке", "ПослеЗагрузки")
+#: Обработчики в порядке выполнения. У ПКО — сначала выгрузка у источника,
+#: потом загрузка у приёмника: перед чтением объекта, поиск, после чтения, после записи.
+_PROP_HANDLERS = ("ПередВыгрузкой", "ПриВыгрузке", "ПослеВыгрузки")
+_SECTION_HANDLERS = ("ПередОбработкойВыгрузки", "ПередВыгрузкой", "ПослеОбработкиВыгрузки")
+_PKO_HANDLERS = (
+    "ПередВыгрузкой",
+    "ПриВыгрузке",
+    "ПослеВыгрузки",
+    "ПослеВыгрузкиВФайл",
+    "ПередЗагрузкой",
+    "ПоследовательностьПолейПоиска",
+    "ПриЗагрузке",
+    "ПослеЗагрузки",
+)
+#: Булевы признаки ПКО и ПКС. КД пишет их тегом только со значением Истина.
+PKO_FLAGS = (
+    "СинхронизироватьПоИдентификатору",
+    "ПродолжитьПоискПоПолямПоискаЕслиПоИдентификаторуНеНашли",
+    "НеСоздаватьЕслиНеНайден",
+    "НеЗамещать",
+    "ПриПереносеОбъектаПоСсылкеУстанавливатьТолькоGIUD",
+    "НеВыгружатьОбъектыСвойствПоСсылкам",
+    "ГенерироватьНовыйНомерИлиКодЕслиНеУказан",
+    "НеЗапоминатьВыгруженные",
+    "ВыгружатьОбъектТолькоПриНаличииНаНегоСсылки",
+)
+_PROP_FLAGS = ("ПолучитьИзВходящихДанных", "НеЗамещать")
+
+
+def _flags(el: ET.Element, names: tuple[str, ...]) -> frozenset[str]:
+    return frozenset(n for n in names if _text(el, n) == "true")
 
 
 def _parse_prop(el: ET.Element, inherited_off: bool) -> Prop:
     src = el.find("Источник")
     dst = el.find("Приемник")
+    required = el.get("Обязательное", "false") == "true"
     return Prop(
         code=_text(el, "Код"),
         name=_text(el, "Наименование"),
@@ -298,10 +352,11 @@ def _parse_prop(el: ET.Element, inherited_off: bool) -> Prop:
         dst_type=(dst.get("Тип", "") if dst is not None else ""),
         dst_kind=(dst.get("Вид", "") if dst is not None else ""),
         conv_rule=_text(el, "КодПравилаКонвертации"),
-        search=el.get("Поиск", "false") == "true",
+        search=required or el.get("Поиск", "false") == "true",
         disabled=inherited_off or _disabled(el),
-        handler=_text(el, "ПередВыгрузкой"),
+        handlers=_handlers(el, _PROP_HANDLERS),
         param=_text(el, "ИмяПараметраДляПередачи"),
+        flags=_flags(el, _PROP_FLAGS) | ({"Обязательное"} if required else set()),
     )
 
 
@@ -316,15 +371,16 @@ def _parse_pko(el: ET.Element, off: bool) -> Pko:
             elif child.tag == "Группа":
                 sec_src = child.find("Источник")
                 sec_dst = child.find("Приемник")
+                sec_off = off or _disabled(child)
                 sections.append(
                     Section(
                         name=_text(child, "Наименование"),
                         src=(sec_src.get("Имя", "") if sec_src is not None else ""),
                         dst=(sec_dst.get("Имя", "") if sec_dst is not None else ""),
-                        props=[
-                            _parse_prop(p, off or _disabled(child))
-                            for p in child.findall("Свойство")
-                        ],
+                        props=[_parse_prop(p, sec_off) for p in child.findall("Свойство")],
+                        code=_text(child, "Код"),
+                        disabled=sec_off,
+                        handlers=_handlers(child, _SECTION_HANDLERS),
                     )
                 )
     handlers = _handlers(el, _PKO_HANDLERS)
@@ -338,6 +394,7 @@ def _parse_pko(el: ET.Element, off: bool) -> Pko:
         sections=sections,
         handlers=handlers,
         blocks=_extract_blocks("\n".join(handlers.values())),
+        flags=_flags(el, PKO_FLAGS),
     )
 
 
@@ -440,7 +497,9 @@ def _parse_pro(el: ET.Element, off: bool) -> Pro:
         code=_text(el, "Код"),
         name=_text(el, "Наименование"),
         obj=_text(el, "ОбъектНастройки"),
-        disabled=off,
+        # Правило без Валидное="true" БСП не загружает (ЗагрузитьПравилоРегистрации).
+        disabled=off or el.get("Валидное") != "true",
+        unload_mode=_text(el, "РеквизитРежимаВыгрузки"),
         plan_filter=plan_filter,
         obj_filter=obj_filter,
         handlers=_handlers(el, _PRO_HANDLERS),
@@ -451,7 +510,29 @@ def _parse_pro(el: ET.Element, off: bool) -> Pro:
 # ---------------------------------------------------------------------------
 # Чтение текста обработчиков
 
-RULE_KINDS = ("ПВД", "ПКО", "ПРО", "Алгоритм", "Запрос")
+RULE_KINDS = ("ПВД", "ПКО", "ПРО", "Алгоритм", "Запрос", "Конвертация")
+
+#: События уровня всей конвертации, по ходу обмена: выгрузка у источника, загрузка у приёмника.
+#: Объектные из них (ПередВыгрузкойОбъекта, ПередКонвертациейОбъекта и т. д.) срабатывают
+#: для каждого объекта, до обработчиков ветки и правила.
+CONVERSION_HANDLERS = (
+    "ПослеЗагрузкиПравилОбмена",
+    "ПередВыгрузкойДанных",
+    "ПередПолучениемИзмененныхОбъектов",
+    "ПередВыгрузкойОбъекта",
+    "ПередКонвертациейОбъекта",
+    "ПослеВыгрузкиОбъекта",
+    "ПередОтправкойИнформацииОбУдалении",
+    "ПослеВыгрузкиДанных",
+    "ПередЗагрузкойДанных",
+    "ПослеЗагрузкиПараметров",
+    "ПередЗагрузкойОбъекта",
+    "ПослеЗагрузкиОбъекта",
+    "ПриПолученииИнформацииОбУдалении",
+    "ПослеПолученияИнформацииОбУзлахОбмена",
+    "ПослеЗагрузкиДанных",
+)
+CONVERSION_CODE = "Конвертация"
 
 #: Вид правила → имена его обработчиков в том порядке, в каком они выполняются.
 #: У алгоритмов и именованных запросов обработчик один, и он весь их текст.
@@ -461,6 +542,7 @@ HANDLER_NAMES: dict[str, tuple[str, ...]] = {
     "ПРО": _PRO_HANDLERS,
     "Алгоритм": ("Текст",),
     "Запрос": ("Текст",),
+    "Конвертация": CONVERSION_HANDLERS,
 }
 
 _PAGE_CAP = 2000  # потолок страницы, чтобы ответ не раздулся до неотправляемого
@@ -552,8 +634,9 @@ def matching_lines(code: str, needle: str, limit: int = 5) -> list[tuple[int, st
 # ---------------------------------------------------------------------------
 # Обработчики реквизитов (ПКС)
 
-#: У реквизита обработчик один — это и есть «условие заполнения реквизита».
-PROP_HANDLER = "ПередВыгрузкой"
+#: Обработчики реквизита и табличной части, в порядке выполнения.
+PROP_HANDLERS = _PROP_HANDLERS
+SECTION_HANDLERS = _SECTION_HANDLERS
 
 
 def all_props(pko: Pko) -> list[tuple[str, Prop]]:
@@ -578,7 +661,7 @@ def _prop_label(section: str, prop: Prop) -> str:
     parts = [f"код {prop.code}", f"приёмник {prop_target(prop)}"]
     if section:
         parts.append(f"табличная часть {section}")
-    parts.append("есть обработчик" if prop.handler else "без обработчика")
+    parts.append(f"обработчики: {', '.join(prop.handlers)}" if prop.handlers else "без обработчика")
     return ", ".join(parts)
 
 
@@ -612,21 +695,53 @@ def find_prop(pko: Pko, name: str) -> tuple[str, Prop]:
     )
 
 
-def prop_handler(pko: Pko, name: str, handler: str = "") -> tuple[str, Prop]:
-    """Реквизит, у которого есть обработчик: (табличная часть, реквизит).
+def _pick_handler(handlers: dict[str, str], handler: str, order: tuple[str, ...], what: str) -> str:
+    """Имя обработчика: указанное (без учёта регистра) или единственное.
 
-    handler можно не указывать; указан — обязан быть ПередВыгрузкой, других у
-    реквизита не бывает, и молча подменять чужое имя нельзя.
+    Обработчиков несколько, а имя не названо — ошибка с перечнем, а не выбор
+    наугад: «перед выгрузкой» и «после выгрузки» делают разное.
     """
-    if handler and handler.casefold() != PROP_HANDLER.casefold():
-        raise LookupError(f"у реквизита один обработчик — {PROP_HANDLER}, а не «{handler}»")
+    names = [n for n in order if n in handlers]
+    if handler:
+        for real in names:
+            if real.casefold() == handler.casefold():
+                return real
+        raise LookupError(f"у {what} нет обработчика «{handler}». Есть: {', '.join(names)}")
+    if len(names) == 1:
+        return names[0]
+    raise LookupError(f"у {what} обработчиков несколько: {', '.join(names)}. Укажите handler.")
+
+
+def prop_handler(pko: Pko, name: str, handler: str = "") -> tuple[str, Prop, str]:
+    """Обработчик реквизита: (табличная часть, реквизит, имя обработчика).
+
+    handler можно не указывать, если обработчик у реквизита один.
+    """
     section, prop = find_prop(pko, name)
-    if not prop.handler:
+    if not prop.handlers:
         raise LookupError(
-            f"у реквизита {prop_target(prop)} (код {prop.code}) правила {pko.code} обработчика нет:"
+            f"у реквизита {prop_target(prop)} (код {prop.code}) правила {pko.code} обработчиков нет:"
             " значение переносится прямым сопоставлением"
         )
-    return section, prop
+    what = f"реквизита {prop_target(prop)} (код {prop.code})"
+    return section, prop, _pick_handler(prop.handlers, handler, _PROP_HANDLERS, what)
+
+
+def find_section(pko: Pko, name: str) -> Section | None:
+    """Табличная часть по коду или имени приёмника (наименованию, если приёмника нет)."""
+    needle = name.strip().casefold()
+    for section in pko.sections:
+        if needle and needle in (section.code.casefold(), (section.dst or section.name).casefold()):
+            return section
+    return None
+
+
+def section_handler(section: Section, handler: str = "") -> str:
+    """Имя обработчика табличной части: указанное или единственное."""
+    what = f"табличной части {section.dst or section.name} (код {section.code})"
+    if not section.handlers:
+        raise LookupError(f"у {what} обработчиков нет")
+    return _pick_handler(section.handlers, handler, _SECTION_HANDLERS, what)
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +755,7 @@ def _parse_snippets(node: ET.Element | None, tag: str, group: str = "") -> dict[
         if child.tag == "Группа":
             out.update(_parse_snippets(child, tag, child.get("Имя", "")))
         elif child.tag == tag:
-            name = child.get("Имя", "")
+            name = child.get("Имя", "").rstrip()  # БСП читает имя через СокрП
             text = _text(child, "Текст")
             if not name:
                 continue
@@ -651,7 +766,19 @@ def _parse_snippets(node: ET.Element | None, tag: str, group: str = "") -> dict[
                 handlers={"Текст": text} if text else {},
                 group=group,
                 pko_calls=_pko_calls(text),
+                on_import=child.get("ИспользуетсяПриЗагрузке") == "true",
             )
+    return out
+
+
+def _duplicates(kind: str, names: list[str]) -> list[tuple[str, str]]:
+    """Повторы в списке: БСП хранит такие правила по имени, и последнее затирает первое."""
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for name in names:
+        if name in seen and (kind, name) not in out:
+            out.append((kind, name))
+        seen.add(name)
     return out
 
 
@@ -672,14 +799,36 @@ def load_direction(folder: Path) -> Direction | None:
         raw=raw,
     )
 
+    codes: list[str] = []
     for el, off in _walk_rules(root.find("ПравилаКонвертацииОбъектов")):
         pko = _parse_pko(el, off)
         if pko.code:
+            codes.append(pko.code)
             direction.pko[pko.code] = pko
+    first: dict[str, str] = {}
     for el, off in _walk_rules(root.find("ПравилаВыгрузкиДанных")):
-        direction.pvd.append(_parse_pvd(el, off))
+        pvd = _parse_pvd(el, off)
+        if not pvd.disabled:
+            if pvd.obj in first:
+                pvd.shadowed_by = first[pvd.obj]
+            else:
+                first[pvd.obj] = pvd.code
+        direction.pvd.append(pvd)
     direction.algorithms = _parse_snippets(root.find("Алгоритмы"), "Алгоритм")
     direction.queries = _parse_snippets(root.find("Запросы"), "Запрос")
+    algorithms = root.find("Алгоритмы")
+    names = [a.get("Имя", "").rstrip() for a in algorithms.iter("Алгоритм")] if algorithms is not None else []
+    direction.duplicates = _duplicates("ПКО", codes) + _duplicates("Алгоритм", names)
+    events = _handlers(root, CONVERSION_HANDLERS)
+    if events:
+        direction.conversion = Snippet(
+            code=CONVERSION_CODE,
+            name="события конвертации",
+            disabled=False,
+            handlers=events,
+            group="",
+            pko_calls=_pko_calls("\n".join(events.values())),
+        )
 
     registration = folder / "RegistrationRules.xml"
     if registration.exists():
@@ -687,6 +836,13 @@ def load_direction(folder: Path) -> Direction | None:
         reg_root = ET.fromstring(direction.raw_reg)
         for el, off in _walk_rules(reg_root.find("ПравилаРегистрацииОбъектов")):
             direction.pro.append(_parse_pro(el, off))
+        content = reg_root.find("СоставПланаОбмена")
+        if content is not None:
+            direction.plan_content = {
+                _text(item, "Тип"): _text(item, "Авторегистрация") == "true"
+                for item in content
+                if _text(item, "Тип")
+            }
 
     return direction
 
@@ -841,7 +997,7 @@ class Index:
             raise LookupError(f"вид правила «{kind}» неизвестен. Бывают: {', '.join(RULE_KINDS)}")
 
     def _pools(self, direction: Direction, kind: str = "") -> dict[str, list]:
-        """Правила направления по видам. Пустой вид — все три."""
+        """Правила направления по видам. Пустой вид — все."""
         self._check_kind(kind)
         pools: dict[str, list] = {
             "ПВД": list(direction.pvd),
@@ -849,6 +1005,7 @@ class Index:
             "ПРО": list(direction.pro),
             "Алгоритм": list(direction.algorithms.values()),
             "Запрос": list(direction.queries.values()),
+            "Конвертация": [direction.conversion] if direction.conversion else [],
         }
         return pools if not kind else {kind: pools[kind]}
 
@@ -919,8 +1076,10 @@ class Index:
         номер строки, годный для page_lines.
 
         Попадание в обработчике реквизита несёт ещё «реквизит» и «код
-        реквизита»; фильтр handler для них — ПередВыгрузкой. Отдельного фильтра
-        по реквизиту нет: такой обработчик не длиннее 66 строк, его проще прочитать.
+        реквизита», в обработчике табличной части — «табличная часть» и её
+        код; фильтр handler — имя обработчика (ПередВыгрузкой, ПослеВыгрузки…).
+        Отдельного фильтра по реквизиту нет: такие обработчики короткие, их
+        проще прочитать.
 
         Отбор rule понимает то же, что find_rule: код, наименование, имя
         объекта — и разрешается в каждом направлении отдельно. Подошло несколько
@@ -990,20 +1149,28 @@ class Index:
                 for name, text in pko.handlers.items():
                     if suits_handler(name) and add_code(exch, "ПКО", pko.code, where, name, text):
                         return hits
-                # Обработчики реквизитов: там живёт условие заполнения реквизита.
-                if not suits_handler(PROP_HANDLER):
-                    continue
+                # Обработчики табличных частей и реквизитов: там живёт условие
+                # заполнения строк и реквизита.
+                for section in pko.sections:
+                    shown = section.dst or section.name
+                    extra = {"табличная часть": shown, "код табличной части": section.code}
+                    for name, text in section.handlers.items():
+                        if suits_handler(name) and add_code(
+                            exch, "ПКО", pko.code, f"{where}, табличная часть {shown}",
+                            name, text, **extra,
+                        ):
+                            return hits
                 for section, prop in all_props(pko):
-                    if not prop.handler:
-                        continue
                     target = prop_target(prop)
                     extra = {"реквизит": target, "код реквизита": prop.code}
                     if section:
                         extra["табличная часть"] = section
                     shown = f"{section}.{target}" if section else target
-                    if add_code(exch, "ПКО", pko.code, f"{where}, реквизит {shown}",
-                                PROP_HANDLER, prop.handler, **extra):
-                        return hits
+                    for name, text in prop.handlers.items():
+                        if suits_handler(name) and add_code(
+                            exch, "ПКО", pko.code, f"{where}, реквизит {shown}", name, text, **extra
+                        ):
+                            return hits
 
             for pvd in exch.pvd:
                 if not suits(exch, "ПВД", pvd.code):
@@ -1024,14 +1191,16 @@ class Index:
                     if suits_handler(name) and add_code(exch, "ПРО", pro.code, where, name, text):
                         return hits
 
+            conversion = {CONVERSION_CODE: exch.conversion} if exch.conversion else {}
             for kind_, pool, label in (
                 ("Алгоритм", exch.algorithms, "общий алгоритм"),
                 ("Запрос", exch.queries, "именованный запрос"),
+                ("Конвертация", conversion, "события конвертации"),
             ):
                 for snip in pool.values():
                     if not suits(exch, kind_, snip.code):
                         continue
-                    where = f"{label} {snip.code}"
+                    where = label if kind_ == "Конвертация" else f"{label} {snip.code}"
                     for name, text in snip.handlers.items():
                         if suits_handler(name) and add_code(
                             exch, kind_, snip.code, where, name, text

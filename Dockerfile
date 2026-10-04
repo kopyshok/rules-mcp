@@ -9,8 +9,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY rules_index.py query_extract.py server.py ./
-COPY test_rules_index.py test_reading.py test_query_extract.py ./
+COPY rules_index.py query_extract.py checks.py server.py ./
+COPY test_rules_index.py test_reading.py test_query_extract.py test_checks.py ./
 
 ENV RULES_DIR=/data/rules \
     PYTHONUNBUFFERED=1

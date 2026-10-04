@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-__version__ = "2.1.0"  # см. CHANGELOG.md
+__version__ = "3.0.0"  # см. CHANGELOG.md
 
 import os
 import shutil
@@ -29,18 +29,22 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastmcp import FastMCP
 
+import checks
 from query_extract import extract_queries
 from rules_index import (
-    PROP_HANDLER,
+    CONVERSION_CODE,
+    PKO_FLAGS,
     Index,
     all_props,
     branch_call_places,
+    find_section,
     handler_names,
     handler_text,
     obj_short,
     page_lines,
     prop_handler,
     prop_target,
+    section_handler,
 )
 
 # ---------------------------------------------------------------------------
@@ -237,6 +241,32 @@ def exchange_overview(direction: str = "") -> dict:
     }
 
 
+def _no_registration(exch, pvds) -> str:
+    """Что значит отсутствие правил регистрации: при обмене через план выгружается
+    только то, что стоит в очереди узла, а без правил туда ставит лишь авторегистрация."""
+    if not exch.raw_reg:
+        return "правил регистрации в комплекте нет — попадает ли объект в очередь на выгрузку, не видно"
+    if exch.plan_content is None:
+        return (
+            "правил регистрации нет, а состава плана в правилах регистрации не записано —"
+            " попадает ли объект в очередь на выгрузку, не видно"
+        )
+    obj = pvds[0].obj if pvds else ""
+    snapshot = "по снимку состава плана в правилах регистрации; окончательно — состав плана в конфигурации источника"
+    if obj not in exch.plan_content:
+        return (
+            "правил регистрации нет, и в составе плана обмена объекта нет: при обмене через план"
+            " в очередь он не попадает, ветки выгрузки не срабатывают — только при ручной выгрузке"
+            f" универсальной обработкой ({snapshot})"
+        )
+    if exch.plan_content[obj]:
+        return f"правил регистрации нет; объект в составе плана с авторегистрацией — изменения регистрируются для всех узлов ({snapshot})"
+    return (
+        "правил регистрации нет; объект в составе плана без авторегистрации — в очередь попадает"
+        f" только ручной регистрацией ({snapshot})"
+    )
+
+
 @mcp.tool
 def trace_document(document: str, direction: str) -> dict:
     """Что происходит с документом при обмене — от регистрации до приёмника.
@@ -285,9 +315,28 @@ def trace_document(document: str, direction: str) -> dict:
             "отбор по объекту": p.obj_filter or "без отбора",
             "отбор по плану обмена": p.plan_filter or "без отбора",
             "обработчики": sorted(p.handlers),
+            **(
+                {"режим выгрузки задаёт реквизит узла": p.unload_mode}
+                if p.unload_mode
+                else {}
+            ),
         }
         for p in pros
     ]
+
+    # Каскад через реквизит по умолчанию передаёт только ссылку (поля поиска):
+    # документ этим обменом целиком не создаётся. Какие правила уходят только
+    # ссылкой, решает проверка.
+    ref_only = {f["правило"] for f in checks.run(exch) if f["проверка"] == "только ссылкой"}
+
+    def cascade_docs(cascades: list[str], only_ref: bool) -> list[str]:
+        return sorted(
+            {
+                obj_short(exch.pko[c].dst)
+                for c in cascades
+                if c in exch.pko and exch.pko[c].dst.startswith("Документ") and (c in ref_only) == only_ref
+            }
+        )
 
     branches = []
     receivers: dict[str, set[str]] = {}
@@ -296,13 +345,9 @@ def trace_document(document: str, direction: str) -> dict:
         for name in pvd.pko_calls:
             pko = exch.pko.get(name)
             cascades = ix.cascades(exch, name) if pko else []
-            doc_cascades = sorted(
-                {
-                    obj_short(exch.pko[c].dst)
-                    for c in cascades
-                    if c in exch.pko and exch.pko[c].dst.startswith("Документ")
-                }
-            )
+            doc_cascades = cascade_docs(cascades, only_ref=False)
+            ref_cascades = cascade_docs(cascades, only_ref=True)
+            remarks = sorted({f["проверка"] for f in checks.for_rule(exch, "ПКО", name)})
             called.append(
                 {
                     "правило конвертации": name,
@@ -310,14 +355,18 @@ def trace_document(document: str, direction: str) -> dict:
                     "отключено": bool(pko and pko.disabled),
                     "документ приёмника": obj_short(pko.dst) if pko else "—",
                     "каскадом создаются документы": doc_cascades,
+                    **({"каскадом только ссылкой": ref_cascades} if ref_cascades else {}),
                     "всего подчинённых правил": len(cascades),
                     **branch_call_places(pvd, name),
+                    **({"замечания проверки": remarks} if remarks else {}),
                 }
             )
             if pko and not pko.disabled:
                 receivers.setdefault(obj_short(pko.dst), set()).add(name)
                 for extra in doc_cascades:
                     receivers.setdefault(extra, set()).add(f"каскад из {name}")
+                for extra in ref_cascades:
+                    receivers.setdefault(extra, set()).add(f"только ссылка из {name}, документ не создаётся")
         # Вызов может стоять не в самой ветке, а в общем алгоритме, который она
         # зовёт. В коде ветки его не видно, поэтому показываем отдельно.
         via_algorithms = ix.algorithms_used(exch, "\n".join(pvd.handlers.values()))
@@ -328,12 +377,13 @@ def trace_document(document: str, direction: str) -> dict:
                     continue
                 receivers.setdefault(obj_short(pko.dst), set()).add(f"через алгоритм {algorithm}")
                 # Каскады у них такие же, как у вызванных напрямую.
-                for child in ix.cascades(exch, name):
-                    sub = exch.pko.get(child)
-                    if sub is not None and sub.dst.startswith("Документ"):
-                        receivers.setdefault(obj_short(sub.dst), set()).add(
-                            f"каскад из {name} (через алгоритм {algorithm})"
-                        )
+                cascades = ix.cascades(exch, name)
+                for extra in cascade_docs(cascades, only_ref=False):
+                    receivers.setdefault(extra, set()).add(f"каскад из {name} (через алгоритм {algorithm})")
+                for extra in cascade_docs(cascades, only_ref=True):
+                    receivers.setdefault(extra, set()).add(
+                        f"только ссылка из {name} (через алгоритм {algorithm}), документ не создаётся"
+                    )
         branch = {
             "код": pvd.code,
             "отключено": pvd.disabled,
@@ -347,33 +397,69 @@ def trace_document(document: str, direction: str) -> dict:
             branch["где вызываются правила из общих алгоритмов"] = ix.algorithm_call_places(
                 exch, pvd, "ПВД"
             )
-        if pvd.custom_selection:
-            branch["внимание"] = (
-                f"отбор произвольным алгоритмом: объект выборки {obj_short(pvd.obj)}"
-                " декоративен, настоящий отбор задан запросом в обработчике"
-            )
+        # Вторая ветка на тот же объект и то, что обмен через план не исполняет
+        # (произвольный отбор, выборка и «Отказ» в «перед обработкой правила»).
+        remarks = [f"{f['проверка']}: {f['суть']}" for f in checks.for_rule(exch, "ПВД", pvd.code)]
+        if remarks:
+            branch["замечания проверки"] = remarks
         branches.append(branch)
 
+    # Общие события конвертации срабатывают для каждого выгружаемого объекта раньше
+    # обработчиков ветки: «перед выгрузкой объекта» может отказать в выгрузке любому.
+    events = exch.conversion.handlers if exch.conversion else {}
+    common = [n for n in ("ПередВыгрузкойОбъекта", "ПередКонвертациейОбъекта", "ПослеВыгрузкиОбъекта") if n in events]
     return {
         "направление": exch.title,
         "документ": document,
-        "регистрация": registration or "правил регистрации нет — документ выгружается иначе",
+        "регистрация": registration or _no_registration(exch, pvds),
         "выгрузка": branches or "правил выгрузки нет",
         "документы приёмника": {k: sorted(v) for k, v in sorted(receivers.items())},
+        **(
+            {
+                "общие обработчики для каждого объекта": common,
+                "как прочитать общие": f"get_rule_handler с правилом «{CONVERSION_CODE}»",
+            }
+            if common
+            else {}
+        ),
         "подсказка": "Полный состав реквизитов правила — инструмент get_conversion_rule. "
-        "Что правила ждут от конфигурации приёмника — receiver_fields.",
+        "Что правила ждут от конфигурации приёмника — receiver_fields. "
+        "Замечания проверки подробно — check_rules с правилом.",
         **status(),
     }
 
 
+#: Признаки ПКО и ПКС словами. Что каждый делает в БСП — в базе знаний.
+_PKO_FLAG_NAMES = {
+    "СинхронизироватьПоИдентификатору": "синхронизация по идентификатору",
+    "ПродолжитьПоискПоПолямПоискаЕслиПоИдентификаторуНеНашли":
+        "продолжать поиск по полям, если по идентификатору не нашли",
+    "НеСоздаватьЕслиНеНайден": "не создавать, если не найден",
+    "НеЗамещать": "не замещать найденный объект",
+    "ПриПереносеОбъектаПоСсылкеУстанавливатьТолькоGIUD": "при переносе по ссылке — только идентификатор",
+    "НеВыгружатьОбъектыСвойствПоСсылкам": "не выгружать объекты свойств по ссылкам",
+    "ГенерироватьНовыйНомерИлиКодЕслиНеУказан": "новый номер или код, если не указан",
+    "НеЗапоминатьВыгруженные": "не запоминать выгруженные",
+    "ВыгружатьОбъектТолькоПриНаличииНаНегоСсылки": "выгружать только при наличии ссылки",
+}
+_PROP_FLAG_NAMES = {
+    "Обязательное": "обязательное",
+    "ПолучитьИзВходящихДанных": "получить из входящих данных",
+    "НеЗамещать": "не замещать у найденного",
+}
+
+
 @mcp.tool
 def get_conversion_rule(rule: str, direction: str, verbose: bool = False) -> dict:
-    """Карточка одного правила конвертации: реквизиты, табличные части, каскады.
+    """Карточка одного правила конвертации: признаки, реквизиты, табличные части, каскады.
 
-    Показывает соответствия «реквизит источника → реквизит приёмника» с типами,
-    отмечает поля поиска, отключённые строки и реквизиты, заполняемые алгоритмом
-    (у них пустой источник). С verbose=True добавляет тексты обработчиков —
-    они объёмные, поэтому по умолчанию выключены.
+    Показывает признаки правила (синхронизация по идентификатору, «не замещать»,
+    «не создавать, если не найден» и др.), соответствия «реквизит источника →
+    реквизит приёмника» с типами, поля поиска, отключённые строки, реквизиты,
+    заполняемые алгоритмом (у них пустой источник), обработчики реквизитов и
+    табличных частей с кодами для чтения, замечания проверки по правилу.
+    С verbose=True добавляет тексты обработчиков правила — они объёмные,
+    поэтому по умолчанию выключены.
     """
     ix = index()
     exch = ix.resolve(direction)
@@ -395,15 +481,31 @@ def get_conversion_rule(rule: str, direction: str, verbose: bool = False) -> dic
             item["через правило"] = prop.conv_rule
         if prop.search:
             item["поле поиска"] = True
+        for flag, title in _PROP_FLAG_NAMES.items():
+            if flag in prop.flags:
+                item[title] = True
         if prop.disabled:
             item["отключено"] = True
         if prop.param:
             item["параметр"] = prop.param
-        if prop.handler:
-            item["есть обработчик"] = True
+        if prop.handlers:
+            item["обработчики"] = list(prop.handlers)
             item["код реквизита"] = prop.code
         return item
 
+    def section(s) -> dict:
+        item = {"код": s.code, "источник": s.src, "приёмник": s.dst}
+        if s.disabled:
+            item["отключено"] = True
+        if s.handlers:
+            item["обработчики"] = list(s.handlers)
+        item["строки"] = [row(p) for p in s.props]
+        return item
+
+    remarks = [
+        {k: v for k, v in f.items() if k not in ("уровень", "вид правила", "правило", "чем грозит")}
+        for f in checks.for_rule(exch, "ПКО", pko.code)
+    ]
     card = {
         "направление": exch.title,
         "правило": pko.code,
@@ -411,18 +513,13 @@ def get_conversion_rule(rule: str, direction: str, verbose: bool = False) -> dic
         "отключено": pko.disabled,
         "источник": pko.src,
         "приёмник": pko.dst,
+        "признаки": [_PKO_FLAG_NAMES[f] for f in PKO_FLAGS if f in pko.flags],
         "процессы": pko.blocks,
         "шапка": [row(p) for p in pko.props],
-        "табличные части": [
-            {
-                "источник": s.src,
-                "приёмник": s.dst,
-                "строки": [row(p) for p in s.props],
-            }
-            for s in pko.sections
-        ],
+        "табличные части": [section(s) for s in pko.sections],
         "каскады в подчинённые правила": ix.cascades(exch, pko.code),
-        "обработчики": sorted(pko.handlers),
+        "обработчики": handler_names("ПКО", pko.handlers),
+        **({"замечания проверки": remarks} if remarks else {}),
         **status(),
     }
     if verbose:
@@ -464,21 +561,24 @@ def get_rule_handler(
     регистрации коды числовые, и «ПеремещениеТоваров» для них понятнее, чем
     «000000039». Подошло несколько правил — в ответе перечень, выберите код.
 
-    Вид правила (ПВД, ПКО, ПРО, Алгоритм, Запрос) можно не указывать, если и так
-    однозначно. Коды веток выгрузки и правил конвертации местами совпадают —
-    тогда вид спросят. Читаются и общие алгоритмы с именованными запросами: у
-    них один обработчик с именем «Текст».
+    Вид правила (ПВД, ПКО, ПРО, Алгоритм, Запрос, Конвертация) можно не
+    указывать, если и так однозначно. Коды веток выгрузки и правил конвертации
+    местами совпадают — тогда вид спросят. Читаются и общие алгоритмы с
+    именованными запросами (один обработчик «Текст»), и общие события всей
+    конвертации — правило «Конвертация»: они срабатывают для каждого объекта
+    раньше обработчиков ветки и правила.
 
     Без параметра handler возвращает перечень обработчиков правила и размер
     каждого — с этого стоит начинать. Если показано не всё, в ответе будет
     «следующая строка»: повторный вызов с этим start_line даёт продолжение.
 
-    prop — обработчик отдельного реквизита правила конвертации: там лежит
-    условие заполнения реквизита, отдельное от условий выбора правила.
-    Реквизит называется кодом (надёжно) или именем приёмника (если оно в
-    правиле одно). Обработчик у реквизита один, ПередВыгрузкой: handler можно
-    не указывать, а указанный другой — ошибка. Какие реквизиты имеют
-    обработчики, видно в перечне обработчиков правила конвертации.
+    prop — обработчик реквизита или табличной части правила конвертации: там
+    лежит условие заполнения, отдельное от условий выбора правила. Называется
+    кодом (надёжно) или именем приёмника (если оно в правиле одно). У реквизита
+    до трёх обработчиков (ПередВыгрузкой, ПриВыгрузке, ПослеВыгрузки), у
+    табличной части — ПередОбработкойВыгрузки, ПередВыгрузкой,
+    ПослеОбработкиВыгрузки; если он один, handler можно не указывать. Коды
+    видны в перечне обработчиков правила конвертации.
     """
     ix = index()
     exch = ix.resolve(direction)
@@ -493,14 +593,31 @@ def get_rule_handler(
         "отключено": found.disabled,
     }
     if prop:
-        section, row = prop_handler(found, prop, handler)
+        # Коды реквизитов и табличных частей внутри правила не пересекаются.
+        table = find_section(found, prop)
+        if table is None or table.code.casefold() != prop.strip().casefold():
+            try:
+                section, row, name = prop_handler(found, prop, handler)
+            except LookupError:
+                if table is None:
+                    raise
+            else:
+                return {
+                    **head,
+                    "реквизит": prop_target(row),
+                    "код реквизита": row.code,
+                    **({"табличная часть": section} if section else {}),
+                    "обработчик": name,
+                    **page_lines(row.handlers[name], start_line, max_lines),
+                    **status(),
+                }
+        name = section_handler(table, handler)
         return {
             **head,
-            "реквизит": prop_target(row),
-            "код реквизита": row.code,
-            **({"табличная часть": section} if section else {}),
-            "обработчик": PROP_HANDLER,
-            **page_lines(row.handler, start_line, max_lines),
+            "табличная часть": table.dst or table.name,
+            "код табличной части": table.code,
+            "обработчик": name,
+            **page_lines(table.handlers[name], start_line, max_lines),
             **status(),
         }
     if not handler:
@@ -516,14 +633,26 @@ def get_rule_handler(
             # Без этого об обработчиках реквизитов не догадаться: их больше,
             # чем обработчиков самих правил.
             own = {
-                row.code: f"{section + '.' if section else ''}{prop_target(row)}, "
-                f"строк {len(row.handler.splitlines())}"
+                row.code: f"{section + '.' if section else ''}{prop_target(row)}: "
+                + ", ".join(f"{n} ({len(t.splitlines())} стр.)" for n, t in row.handlers.items())
                 for section, row in all_props(found)
-                if row.handler
+                if row.handlers
+            }
+            tables = {
+                s.code: f"{s.dst or s.name}: "
+                + ", ".join(f"{n} ({len(t.splitlines())} стр.)" for n, t in s.handlers.items())
+                for s in found.sections
+                if s.handlers
             }
             if own:
                 listing["обработчики реквизитов"] = own
-                listing["подсказка"] += " Обработчик реквизита — параметр prop с его кодом."
+            if tables:
+                listing["обработчики табличных частей"] = tables
+            if own or tables:
+                listing["подсказка"] += (
+                    " Обработчик реквизита или табличной части — параметр prop с кодом"
+                    " и handler с именем обработчика."
+                )
         return {**listing, **status()}
 
     name, text = handler_text(found, kind, handler)
@@ -654,8 +783,10 @@ def search_rules(
     """Где в правилах упоминается реквизит, алгоритм или фрагмент логики.
 
     Ищет по соответствиям реквизитов, отборам регистрации и текстам
-    обработчиков всех видов правил. Без направления — по всем сразу. Нужен,
-    когда неизвестно, в каком правиле искать: «где вообще трогается СкладОрдер».
+    обработчиков всех видов правил — включая обработчики реквизитов и
+    табличных частей, обработчик поиска и общие события конвертации. Без
+    направления — по всем сразу. Нужен, когда неизвестно, в каком правиле
+    искать: «где вообще трогается СкладОрдер».
 
     Отвечает фрагментами строк, а не логикой целиком. По одной строке судить о
     том, при каких условиях вызывается правило конвертации, нельзя: у каждого
@@ -674,6 +805,59 @@ def search_rules(
         "всего": len(hits),
         **({"обрезано по лимиту": True} if len(hits) >= limit else {}),
         "подсказка": "Полный текст — get_rule_handler с тем же правилом и обработчиком.",
+        **status(),
+    }
+
+
+@mcp.tool
+def check_rules(direction: str = "", rule: str = "", check: str = "", limit: int = 50) -> dict:
+    """Проверка правил: что в них сломано или при обмене через план не сработает.
+
+    Ошибки: обращение к несуществующему алгоритму или к алгоритму другого
+    режима, ссылка на несуществующее правило конвертации, повтор кода.
+    Предупреждения: вторая ветка выгрузки на тот же объект (не выполняется),
+    части ветки, которые обмен через план не исполняет (произвольный отбор,
+    выборка и «Отказ» в «перед обработкой правила»), ветка на объект, который
+    не регистрируется к обмену (нечего выгружать), правило конвертации,
+    которое ничем не вызывается, объект, который уходит только ссылкой, формы
+    поиска в приёмнике, дающие дубли или слияние, запись объекта в «после
+    загрузки».
+
+    Без направления — сводка по всем. rule — код правила, check — название
+    проверки из сводки: так сужается перечень. У каждого замечания — правило,
+    обработчик, строка, код реквизита или табличной части: по ним читайте
+    get_rule_handler. Замечание — повод прочитать, а не приговор: в нём
+    сказано, чем это грозит и когда это штатно.
+
+    Чего проверка не видит: конфигураций (нет ли реквизита у приёмника —
+    receiver_fields и сервер конфигураций) и живого обмена.
+    """
+    ix = index()
+    targets = [ix.resolve(direction)] if direction else list(ix.directions.values())
+    if check and check not in checks.CHECKS:
+        raise LookupError(f"проверки «{check}» нет. Есть: {', '.join(checks.CHECKS)}")
+    summary: dict[str, dict[str, int]] = {}
+    found: list[dict] = []
+    for exch in targets:
+        items = checks.run(exch)
+        counts: dict[str, int] = {}
+        for f in items:
+            counts[f["проверка"]] = counts.get(f["проверка"], 0) + 1
+        summary[exch.title] = counts
+        found += [
+            {"направление": exch.title, **f}
+            for f in items
+            if (not rule or f["правило"].casefold() == rule.strip().casefold())
+            and (not check or f["проверка"] == check)
+        ]
+    shown = found[: max(1, limit)]
+    return {
+        "сводка": summary,
+        "замечания": shown,
+        "всего по отбору": len(found),
+        **({"обрезано по лимиту": True} if len(found) > len(shown) else {}),
+        "подсказка": "Сузить — параметрами rule и check. Место в коде — get_rule_handler"
+        " с правилом, обработчиком, prop (код реквизита или табличной части) и start_line.",
         **status(),
     }
 
