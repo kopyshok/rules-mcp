@@ -11,13 +11,12 @@
     GITLAB_BRANCH     ветка с правилами; пусто — ветка по умолчанию
     RULES_SUBDIR      подкаталог внутри репозитория, если правила лежат не в корне
     REFRESH_INTERVAL  период опроса в секундах, 0 — не опрашивать (по умолчанию 3600)
-    REFRESH_PASSWORD  пароль для инструмента «обновить»
     HOST, PORT        адрес прослушивания (0.0.0.0:8000)
 """
 
 from __future__ import annotations
 
-__version__ = "3.0.0"  # см. CHANGELOG.md
+__version__ = "4.0.0"  # см. CHANGELOG.md
 
 import os
 import shutil
@@ -56,11 +55,11 @@ GITLAB_TOKEN = os.getenv("GITLAB_TOKEN", "").strip()
 GITLAB_BRANCH = os.getenv("GITLAB_BRANCH", "").strip()  # пусто — ветка по умолчанию
 RULES_SUBDIR = os.getenv("RULES_SUBDIR", "").strip()
 REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "3600"))
-REFRESH_PASSWORD = os.getenv("REFRESH_PASSWORD", "").strip()
 
 mcp = FastMCP("Правила обмена 1С")
 
 _lock = threading.Lock()
+_refresh_lock = threading.Lock()  # опрос по часам и запрос из чата не лезут в клон одновременно
 _index: Index | None = None
 _state: dict[str, str] = {"версия": "неизвестна", "обновлено": "—", "ошибка": ""}
 
@@ -85,7 +84,10 @@ def _git(*args: str, cwd: Path) -> str:
         ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=300
     )
     if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip()[:400])
+        message = (result.stderr or result.stdout).strip()
+        if GITLAB_TOKEN:  # текст ошибки уходит в чат — токена в нём быть не должно
+            message = message.replace(GITLAB_TOKEN, "***").replace(quote(GITLAB_TOKEN, safe=""), "***")
+        raise RuntimeError(message[:400])
     return result.stdout.strip()
 
 
@@ -126,7 +128,9 @@ def _sync_repo() -> bool:
 
     before = _git("rev-parse", "HEAD", cwd=root)
     branch = _branch_of(root)
-    _git("fetch", "--depth", "1", "origin", branch, cwd=root)
+    # Адрес с токеном — из настроек, а не сохранённый в клоне: иначе после
+    # замены токена или адреса сервис так и ходил бы со старыми.
+    _git("fetch", "--depth", "1", _repo_url(), branch, cwd=root)
     _git("reset", "--hard", "FETCH_HEAD", cwd=root)
     return _git("rev-parse", "HEAD", cwd=root) != before
 
@@ -139,39 +143,43 @@ def _describe_version(root: Path) -> str:
         return "без версии (каталог не под git)"
 
 
-def refresh(force: bool = False) -> dict:
+def refresh() -> dict:
     """Синхронизация с GitLab и пересборка индекса. Индекс подменяется целиком."""
     global _index
-    try:
-        changed = _sync_repo()
-        if not changed and _index is not None and not force:
-            _state["ошибка"] = ""
-            return {"обновление": "не требовалось, правила те же", **status()}
-
-        root = _rules_root()
-        fresh = Index(root)  # строим новый, старый продолжает отвечать
-        with _lock:
-            _index = fresh
-            _state["версия"] = _describe_version(_checkout_root())
+    with _refresh_lock:
+        try:
+            changed = _sync_repo()
             _state["обновлено"] = time.strftime("%d.%m.%Y %H:%M")
-            _state["ошибка"] = ""
-        note = (
-            f"правила обновились, перечитано направлений: {len(fresh.directions)}"
-            if changed
-            else f"правила те же, перечитано заново: {len(fresh.directions)} направлений"
-        )
-        return {"обновление": note, **status()}
-    except Exception as exc:  # правила не обновились — продолжаем на старом индексе
-        _state["ошибка"] = str(exc)
-        return {"обновление": f"не удалось: {exc}", **status()}
+            if not changed and _index is not None:
+                _state["ошибка"] = ""
+                return {"обновление": "не требовалось, правила те же", **status()}
+
+            root = _rules_root()
+            fresh = Index(root, previous=_index)  # строим новый, старый продолжает отвечать
+            with _lock:
+                _index = fresh
+                _state["версия"] = _describe_version(_checkout_root())
+                _state["ошибка"] = ""
+            return {
+                "обновление": f"правила перечитаны, направлений: {len(fresh.directions)}",
+                **status(),
+            }
+        except Exception as exc:  # правила не обновились — продолжаем на старом индексе
+            _state["ошибка"] = str(exc)
+            return {"обновление": f"не удалось: {exc}", **status()}
 
 
 def status() -> dict:
+    problems = []
+    if _state["ошибка"]:
+        problems.append(f"обновление не проходит: {_state['ошибка']}")
+    if _index is not None and _index.errors:
+        problems.append("не прочитаны: " + "; ".join(_index.errors))
     return {
         "версия сервиса": __version__,
         "версия правил": _state["версия"],
         "проверялось": _state["обновлено"],
-        **({"внимание": f"обновление не проходит: {_state['ошибка']}"} if _state["ошибка"] else {}),
+        **({"внимание": " | ".join(problems)} if problems else {}),
     }
 
 
@@ -945,24 +953,20 @@ def receiver_fields(document: str, direction: str, obj: str = "") -> dict:
 
 
 @mcp.tool
-def refresh_rules(password: str) -> dict:
-    """Перечитать правила из GitLab прямо сейчас, не дожидаясь опроса.
+def refresh_rules() -> dict:
+    """Забрать свежие правила из GitLab прямо сейчас, не дожидаясь ежечасной проверки.
 
-    Правила и так подтягиваются автоматически. Инструмент нужен, когда только
-    что выложили релиз. Пароль спрашивается у человека — чтобы обновление не
-    запускалось само по себе.
+    Вызывай, когда человек просит обновить правила или говорит, что только что
+    их выложил. Если правила в GitLab не менялись, ничего не пересобирается —
+    лишний вызов безвреден.
     """
-    if not REFRESH_PASSWORD:
-        raise PermissionError("обновление по запросу отключено: пароль не задан в настройках")
-    if password != REFRESH_PASSWORD:
-        raise PermissionError("неверный пароль")
-    return refresh(force=True)
+    return refresh()
 
 
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    refresh(force=True)
+    refresh()
     if REFRESH_INTERVAL > 0:
         threading.Thread(target=_watcher, daemon=True).start()
     mcp.run(

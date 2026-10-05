@@ -1,18 +1,19 @@
 # Фрагмент для вашего существующего compose с Open WebUI.
 # Целиком этот файл поднимать не надо — скопируйте сервис rules-mcp, том и сеть.
 # Путь в build указан от каталога, где лежит ваш compose.
+# Значения берутся из .env рядом с вашим compose (образец — .env.example);
+# здесь их не правьте, иначе .env перестанет действовать.
 
 services:
   rules-mcp:
     build: ./rules-mcp
-    image: rules-mcp:2.1.0                     # версия из CHANGELOG.md — менять вместе с ней
+    image: rules-mcp:4.0.0                     # версия из CHANGELOG.md — менять вместе с ней
     environment:
-      GITLAB_REPO: https://gitlab.example.ru/exchange/rules.git
-      GITLAB_TOKEN: ${GITLAB_TOKEN}            # deploy-токен, область read_repository
-      GITLAB_BRANCH: main                      # ветка с боевыми правилами — указать явно
-      RULES_SUBDIR: ""                         # подкаталог, если правила не в корне
-      REFRESH_INTERVAL: "3600"                 # опрос раз в час; 0 — не опрашивать
-      REFRESH_PASSWORD: ${RULES_REFRESH_PASSWORD}
+      GITLAB_REPO: ${GITLAB_REPO:-}            # пусто — читать папку на диске, из GitLab не обновляться
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}          # deploy-токен, область read_repository
+      GITLAB_BRANCH: ${GITLAB_BRANCH:-}        # ветка с боевыми правилами — указать явно
+      RULES_SUBDIR: ${RULES_SUBDIR:-}          # подкаталог, если правила не в корне
+      REFRESH_INTERVAL: ${REFRESH_INTERVAL:-3600}  # опрос раз в час; 0 — не опрашивать
     volumes:
       - rules-clone:/data                      # клон переживает перезапуск контейнера
     restart: unless-stopped

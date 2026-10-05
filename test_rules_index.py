@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from rules_index import Index, obj_short
@@ -87,8 +89,31 @@ def main(root: Path) -> int:
         )
 
     print(f"процессов: {len(blocks)}, вызовов у ПТУ: {len(calls)}")
+    проверка_битая_папка(root)
     print("проверка пройдена")
     return 0
+
+
+def проверка_битая_папка(root: Path) -> None:
+    """Битый файл в одной папке не роняет остальные; по ней остаётся прежняя версия."""
+    good = next(p for p in sorted(root.iterdir()) if (p / "ExchangeRules.xml").exists())
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        shutil.copytree(good, work / good.name)
+        (work / "Битая").mkdir()
+        (work / "Битая" / "ExchangeRules.xml").write_text("<не xml", encoding="utf-8")
+
+        ix = Index(work)
+        assert list(ix.directions) == [good.name], f"битая папка повлияла на остальные: {list(ix.directions)}"
+        assert len(ix.errors) == 1 and ix.errors[0].startswith("Битая — "), ix.errors
+        assert "пропущено" in ix.errors[0], ix.errors
+
+        # Папка была исправной, а новый коммит её сломал — отвечаем по прежней версии.
+        (work / good.name / "ExchangeRules.xml").write_bytes(b"\xff\xfe")
+        again = Index(work, previous=ix)
+        assert again.directions[good.name] is ix.directions[good.name], "прежняя версия не сохранилась"
+        assert any(e.startswith(good.name) and "прежняя версия" in e for e in again.errors), again.errors
+    print("  битая папка: остальные читаются, по ней — прежняя версия")
 
 
 if __name__ == "__main__":

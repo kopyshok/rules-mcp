@@ -850,18 +850,32 @@ def load_direction(folder: Path) -> Direction | None:
 class Index:
     """Индекс всех направлений. Строится целиком при старте, живёт в памяти."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, previous: Index | None = None):
         self.root = root
         self.directions: dict[str, Direction] = {}
-        self.reload()
+        self.errors: list[str] = []  # папки, которые не прочитались
+        self.reload(previous)
 
-    def reload(self) -> int:
+    def reload(self, previous: Index | None = None) -> int:
+        """Битая папка не роняет остальные: по ней остаётся прежняя версия, если была."""
         found: dict[str, Direction] = {}
+        errors: list[str] = []
         for folder in sorted(p for p in self.root.iterdir() if p.is_dir()):
-            direction = load_direction(folder)
+            try:
+                direction = load_direction(folder)
+            except Exception as exc:
+                old = previous.directions.get(folder.name) if previous else None
+                if old is not None:
+                    found[old.key] = old
+                errors.append(
+                    f"{folder.name} — {exc}; "
+                    + ("оставлена прежняя версия" if old else "направление пропущено")
+                )
+                continue
             if direction is not None:
                 found[direction.key] = direction
         self.directions = found
+        self.errors = errors
         return len(found)
 
     # -- разрешение имени направления ------------------------------------
